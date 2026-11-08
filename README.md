@@ -30,6 +30,7 @@ python3 test_saas.py
 - `/briefing` + `GET /api/briefing` — AI dispatcher briefing: delayed/at-risk/GPS-stale lists, top delay reasons, recommended actions
 - `POST /api/notify` — `{"id":"TRK-101","channel":"sms","message":"..."}` — Twilio-ready: sends real SMS only if TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM and NOTIFY_TO are set; otherwise logs only and reports sent=false
 - Route optimisation upgraded from nearest-first stub to nearest-first + 2-opt (heuristic, not exact TSP; no time windows/capacity yet)
+- `/dock` + `POST /api/dock/book` — dock scheduling & dwell time: 20 slots (Columbus/Chicago/Detroit/Cincinnati, 2026-11-09), booking cuts dwell to 15 min and improves ETA
 
 ## Pages
 - `/dashboard` — summary cards, search, filter by AI status, shipment table
