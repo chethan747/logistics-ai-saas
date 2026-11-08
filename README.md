@@ -25,6 +25,11 @@ python3 test_saas.py
 - `GET /api/notifications` — demo notification log (not real SMS/email)
 - `GET /api/fleet` — per-driver and per-vehicle analytics
 - `POST /api/gps-ping` — `{"id":"TRK-101","remaining_miles":150,"speed_mph":58,"gps_age_min":2}`
+- `POST /api/chat` — `{"message":"Which trucks are delayed?"}` — live AI chatbot (demo, rule-based, answers from live shipment data)
+- `/map` + `GET /api/map` — live map (Leaflet/OpenStreetMap, origin → destination routes, green/amber/red by AI status)
+- `/briefing` + `GET /api/briefing` — AI dispatcher briefing: delayed/at-risk/GPS-stale lists, top delay reasons, recommended actions
+- `POST /api/notify` — `{"id":"TRK-101","channel":"sms","message":"..."}` — Twilio-ready: sends real SMS only if TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM and NOTIFY_TO are set; otherwise logs only and reports sent=false
+- Route optimisation upgraded from nearest-first stub to nearest-first + 2-opt (heuristic, not exact TSP; no time windows/capacity yet)
 
 ## Pages
 - `/dashboard` — summary cards, search, filter by AI status, shipment table
@@ -49,7 +54,7 @@ admin@demo.local, dispatcher@demo.local, driver@demo.local, customer@demo.local
 4. AI ETA model (`app.predict_eta`) — baseline vs model, window, confidence, delay reasons
 5. GPS ping API with stale-signal handling (15+ min widens window, lowers confidence)
 6. Analytics (counts, status, demo MAE vs baseline) + fleet analytics
-7. v2, working in demo form: route optimisation stub (nearest-first, not a TSP solver),
+7. v2, working in demo form: route optimisation (nearest-first + 2-opt),
    proof of delivery records, notifications log, shipment detail view
 
 ## Next steps to make it production
