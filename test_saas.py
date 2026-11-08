@@ -1,7 +1,7 @@
 """Tests for the SaaS ETA model. Run: python3 test_saas.py"""
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
-from app import predict_eta, optimise_route, record_pod, get_pod, fleet_analytics, list_notifications, init_db, shipment_detail
+from app import predict_eta, optimise_route, record_pod, get_pod, fleet_analytics, list_notifications, init_db, shipment_detail, chat_reply, map_data, dispatcher_briefing, send_notification, list_dock_slots, book_dock_slot, dwell_stats
 
 def base(**kw):
     d = {"id": "TRK-TEST", "remaining_miles": 100, "speed_mph": 55,
@@ -34,8 +34,20 @@ def test_delay_flag():
 
 def test_route_optimisation():
     r = optimise_route([{"place": "B", "miles_from_current": 130, "priority": 1}, {"place": "A", "miles_from_current": 60, "priority": 2}])
-    assert r["optimised_order"] == ["A", "B"] and r["total_miles_estimate"] == 190
-    print("route optimisation stub OK", r["optimised_order"])
+    assert r["optimised_order"] == ["A", "B"] and r["method"] == "nearest-first + 2-opt"
+    r2 = optimise_route([{"place": "Toledo, OH depot", "miles_from_current": 60, "priority": 2}, {"place": "Fort Wayne, IN hub", "miles_from_current": 130, "priority": 1}])
+    assert r2["optimised_order"][0] == "Toledo, OH depot" and r2["total_miles_estimate"] > 0
+    print("route optimisation 2-opt OK", r["optimised_order"], r2["total_miles_estimate"])
+
+def test_map_briefing_notify():
+    init_db()
+    m = map_data()
+    assert len(m) == 8 and m[0]["destination_coords"] is not None
+    b = dispatcher_briefing()
+    assert b["delayed"] and b["recommended_actions"] and "Fleet briefing" in b["summary"]
+    n = send_notification("TRK-101", "sms", "Test update")
+    assert n["provider"] == "log_only" and n["sent"] is False  # no Twilio env in test
+    print("map + briefing + notify OK", len(m), b["delayed"], n["provider"])
 
 def test_pod_and_detail():
     init_db()
@@ -53,7 +65,31 @@ def test_notifications_and_fleet():
     assert "A. Kumar" in f["by_driver"] and "Truck-07" in f["by_vehicle"]
     print("notifications + fleet OK", len(list_notifications()), "notifications")
 
+def test_chatbot():
+    init_db()
+    r = chat_reply("What is TRK-101 ETA?")
+    assert "TRK-101" in r["reply"] and r["shipment_id"] == "TRK-101"
+    r2 = chat_reply("Which trucks are delayed?")
+    assert "TRK-" in r2["reply"] or "no trucks" in r2["reply"].lower()
+    r3 = chat_reply("How do I record proof of delivery?")
+    assert "proof of delivery" in r3["reply"].lower()
+    r4 = chat_reply("blabla unknown")
+    assert "suggestions" in r4
+    print("chatbot OK", r["reply"][:80])
+
+def test_dock_scheduling():
+    init_db()
+    assert len(list_dock_slots()) == 20 and len(list_dock_slots(status="available")) == 20
+    before = next(s for s in __import__("app").all_shipments() if s["id"] == "TRK-103")
+    assert before["dwell_remaining_min"] == 45
+    r = book_dock_slot("DOCK-COLUMBUS-1", "TRK-103")
+    assert r["ok"] is True and r["dwell_remaining_min"] == 15
+    r2 = book_dock_slot("DOCK-COLUMBUS-1", "TRK-101")
+    assert r2["ok"] is False  # already booked
+    assert dwell_stats()["booked_slots"] == 1
+    print("dock scheduling OK", r)
+
 if __name__ == "__main__":
     test_window_and_confidence(); test_traffic_slows_eta(); test_stale_gps_lowers_confidence(); test_delay_flag()
-    test_route_optimisation(); test_pod_and_detail(); test_notifications_and_fleet()
-    print("All 7 tests passed.")
+    test_route_optimisation(); test_pod_and_detail(); test_notifications_and_fleet(); test_chatbot(); test_map_briefing_notify(); test_dock_scheduling()
+    print("All 10 tests passed.")
