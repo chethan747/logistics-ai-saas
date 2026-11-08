@@ -166,7 +166,14 @@ def init_v2_tables(con=None):
         (shipment_id TEXT PRIMARY KEY, method TEXT, signature_name TEXT, otp TEXT, photo_ref TEXT, recorded_at TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS notifications
         (id INTEGER PRIMARY KEY AUTOINCREMENT, shipment_id TEXT, channel TEXT, kind TEXT, message TEXT)""")
-    c.execute("DELETE FROM stops"); c.execute("DELETE FROM notifications")
+    c.execute("""CREATE TABLE IF NOT EXISTS dock_slots
+        (id TEXT PRIMARY KEY, facility TEXT, dock_door TEXT, slot_time TEXT, status TEXT, shipment_id TEXT)""")
+    c.execute("DELETE FROM stops"); c.execute("DELETE FROM notifications"); c.execute("DELETE FROM dock_slots")
+    dock = []
+    for facility, door in [("Columbus DC", "A1"), ("Chicago DC", "B1"), ("Detroit DC", "C1"), ("Cincinnati DC", "D1")]:
+        for i, t in enumerate(["08:00", "10:00", "12:00", "14:00", "16:00"]):
+            dock.append((f"DOCK-{facility.split()[0].upper()}-{i+1}", facility, door, f"2026-11-09 {t}", "available", ""))
+    c.executemany("INSERT INTO dock_slots VALUES (?,?,?,?,?,?)", dock)
     stops = [
         ("TRK-101", 1, "Toledo, OH depot", 60, 2), ("TRK-101", 2, "Fort Wayne, IN hub", 130, 1),
         ("TRK-103", 1, "Toledo, OH depot", 90, 1), ("TRK-103", 2, "Ann Arbor, MI hub", 170, 2),
@@ -192,14 +199,102 @@ def init_v2_tables(con=None):
                       (s["id"], "email", "gps_stale", f"GPS stale for {s['id']}: last ping over 15 minutes ago."))
     con.commit(); con.close()
 
+CITY_COORDS = {
+    "Columbus, OH": (39.96, -82.99), "Chicago, IL": (41.88, -87.63),
+    "Cleveland, OH": (41.50, -81.69), "Detroit, MI": (42.33, -83.05),
+    "Cincinnati, OH": (39.10, -84.51), "Indianapolis, IN": (39.77, -86.16),
+    "Pittsburgh, PA": (40.44, -79.99), "Toledo, OH depot": (41.65, -83.54),
+    "Toledo, OH": (41.65, -83.54), "Fort Wayne, IN hub": (41.08, -85.14),
+    "Fort Wayne, IN": (41.08, -85.14), "Ann Arbor, MI hub": (42.28, -83.74),
+    "Ann Arbor, MI": (42.28, -83.74), "Cincinnati, OH customer": (39.10, -84.51),
+}
+def haversine_miles(a, b):
+    import math as _m
+    lat1, lon1 = _m.radians(a[0]), _m.radians(a[1]); lat2, lon2 = _m.radians(b[0]), _m.radians(b[1])
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    h = _m.sin(dlat/2)**2 + _m.cos(lat1)*_m.cos(lat2)*_m.sin(dlon/2)**2
+    return 2 * 3959 * _m.asin(_m.sqrt(h))
+
+def _route_cost(order):
+    if not order: return 0
+    total = float(order[0].get("miles_from_current", 0))
+    for prev, cur in zip(order, order[1:]):
+        pa, pb = CITY_COORDS.get(prev["place"]), CITY_COORDS.get(cur["place"])
+        total += haversine_miles(pa, pb) if pa and pb else abs(float(cur.get("miles_from_current", 0)) - float(prev.get("miles_from_current", 0)))
+    return round(total, 1)
+
 def optimise_route(stops):
-    """Route-optimisation STUB (demo): nearest-first, then priority.
-    This is not a TSP solver; it orders stops deterministically so the
-    demo is testable. A production version would use OR-Tools / routing.
-    Returns list of stop dicts in optimised order."""
+    """Improved route optimisation (demo heuristic): nearest-first, then
+    2-opt improvement using haversine distance between known stop cities
+    (fallback: miles_from_current difference). This is NOT an exact TSP
+    solver and does NOT yet handle time windows, vehicle capacity, or
+    driver hours — those are the next production step (OR-Tools)."""
+    if not stops: return {"optimised_order": [], "stops": [], "total_miles_estimate": 0, "method": "nearest-first + 2-opt"}
     ordered = sorted(stops, key=lambda s: (s["miles_from_current"], -s["priority"]))
-    total = sum(s["miles_from_current"] for s in ordered)
-    return {"optimised_order": [s["place"] for s in ordered], "stops": ordered, "total_miles_estimate": total}
+    best, best_cost = ordered, _route_cost(ordered)
+    improved = True
+    while improved:
+        improved = False
+        for i in range(len(best)):
+            for j in range(i+1, len(best)+1):
+                cand = best[:i] + list(reversed(best[i:j])) + best[j:]
+                c = _route_cost(cand)
+                if c < best_cost - 0.1:
+                    best, best_cost, improved = cand, c, True
+    return {"optimised_order": [s["place"] for s in best], "stops": best, "total_miles_estimate": best_cost, "method": "nearest-first + 2-opt"}
+
+def map_data():
+    out = []
+    for s in all_shipments():
+        out.append({"id": s["id"], "origin": s["origin"], "destination": s["destination"],
+                    "origin_coords": CITY_COORDS.get(s["origin"]), "destination_coords": CITY_COORDS.get(s["destination"]),
+                    "driver": s["driver"], "vehicle": s["vehicle"], "status": s["status"],
+                    "ai_status": s["eta"]["status"] if s["eta"] else "delivered",
+                    "eta_minutes": s["eta"]["predicted_minutes"] if s["eta"] else None,
+                    "delay_reasons": s["eta"]["delay_reasons"] if s["eta"] else []})
+    return out
+
+def dispatcher_briefing():
+    from collections import Counter
+    ships = all_shipments(); a = analytics()
+    delayed = [s for s in ships if s["eta"] and s["eta"]["status"] == "delayed"]
+    at_risk = [s for s in ships if s["eta"] and s["eta"]["status"] == "at_risk"]
+    stale = [s for s in ships if s["eta"] and s["eta"]["gps_stale"]]
+    reasons = Counter(r for s in ships if s["eta"] for r in s["eta"]["delay_reasons"] if r != "on schedule")
+    actions = []
+    if delayed: actions.append(f"Contact customers for {len(delayed)} delayed shipment(s): {', '.join(s['id'] for s in delayed)}.")
+    if at_risk: actions.append(f"Watch {len(at_risk)} at-risk shipment(s) and re-check their ETAs before the delivery window.")
+    if stale: actions.append(f"Check GPS for {len(stale)} shipment(s) with stale signal before promising a time.")
+    if not actions: actions.append("No urgent actions — fleet is on schedule in this demo.")
+    return {"total": a["total"], "active": a["active"], "by_status": a["by_status"],
+            "delayed": [s["id"] for s in delayed], "at_risk": [s["id"] for s in at_risk],
+            "gps_stale": [s["id"] for s in stale], "top_delay_reasons": dict(reasons.most_common(5)),
+            "recommended_actions": actions,
+            "summary": f"Fleet briefing: {a['active']} active of {a['total']}. Delayed: {len(delayed)}, at-risk: {len(at_risk)}, GPS stale: {len(stale)}. Top reasons: {dict(reasons.most_common(3)) or 'none'}."}
+
+def send_notification(shipment_id, channel, message):
+    """Twilio-ready notification sender. If TWILIO_ACCOUNT_SID,
+    TWILIO_AUTH_TOKEN, TWILIO_FROM and a destination are set, it really
+    sends via Twilio; otherwise it logs only and honestly reports
+    sent=False, provider=log_only. Never claim a real send without it."""
+    import urllib.request, urllib.parse, base64
+    sid, token, frm = os.environ.get("TWILIO_ACCOUNT_SID"), os.environ.get("TWILIO_AUTH_TOKEN"), os.environ.get("TWILIO_FROM")
+    to = os.environ.get("NOTIFY_TO")
+    if channel == "sms" and sid and token and frm and to:
+        try:
+            data = urllib.parse.urlencode({"From": frm, "To": to, "Body": message}).encode()
+            req = urllib.request.Request(f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json", data=data,
+                headers={"Authorization": "Basic " + base64.b64encode(f"{sid}:{token}".encode()).decode()})
+            urllib.request.urlopen(req, timeout=15)
+            sent, provider = True, "twilio"
+        except Exception as e:
+            sent, provider, err = False, "twilio_failed", str(e)
+            con = sqlite3.connect(DB); con.execute("INSERT INTO notifications (shipment_id, channel, kind, message) VALUES (?,?,?,?)", (shipment_id, channel, "manual_failed", message)); con.commit(); con.close()
+            return {"sent": sent, "provider": provider, "error": err}
+    else:
+        sent, provider = False, "log_only"
+    con = sqlite3.connect(DB); con.execute("INSERT INTO notifications (shipment_id, channel, kind, message) VALUES (?,?,?,?)", (shipment_id, channel, "manual", message)); con.commit(); con.close()
+    return {"sent": sent, "provider": provider, "note": "Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM and NOTIFY_TO to send real SMS." if provider == "log_only" else "Sent via Twilio."}
 
 def get_stops(shipment_id):
     con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
@@ -225,6 +320,42 @@ def list_notifications(shipment_id=None):
     args = () if not shipment_id else (shipment_id,)
     rows = [dict(r) for r in con.execute(q, args)]; con.close(); return rows
 
+def list_dock_slots(status=None, facility=None):
+    con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
+    q, args = "SELECT * FROM dock_slots ORDER BY slot_time", ()
+    if status: q, args = "SELECT * FROM dock_slots WHERE status=? ORDER BY slot_time", (status,)
+    rows = [dict(r) for r in con.execute(q, args)]; con.close()
+    if facility: rows = [r for r in rows if r["facility"] == facility]
+    return rows
+
+def book_dock_slot(slot_id, shipment_id):
+    """Book a dock slot. A booked slot cuts that shipment's dwell to
+    15 min (from its seeded dwell), so its ETA improves — the point of
+    dock scheduling. Returns dict with ok / error."""
+    con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
+    slot = con.execute("SELECT * FROM dock_slots WHERE id=?", (slot_id,)).fetchone()
+    if not slot: con.close(); return {"ok": False, "error": f"slot {slot_id} not found"}
+    if slot["status"] != "available": con.close(); return {"ok": False, "error": f"slot {slot_id} is already {slot['status']}"}
+    ship = con.execute("SELECT * FROM shipments WHERE id=?", (shipment_id,)).fetchone()
+    if not ship: con.close(); return {"ok": False, "error": f"shipment {shipment_id} not found"}
+    con.execute("UPDATE dock_slots SET status='booked', shipment_id=? WHERE id=?", (shipment_id, slot_id))
+    con.execute("UPDATE shipments SET dwell_remaining_min=15 WHERE id=?", (shipment_id,))
+    con.commit(); con.close()
+    return {"ok": True, "slot_id": slot_id, "shipment_id": shipment_id, "facility": slot["facility"], "slot_time": slot["slot_time"], "dwell_remaining_min": 15}
+
+def get_dock_booking(shipment_id):
+    con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
+    r = con.execute("SELECT * FROM dock_slots WHERE shipment_id=?", (shipment_id,)).fetchone()
+    con.close(); return dict(r) if r else None
+
+def dwell_stats():
+    ships = all_shipments()
+    booked = [s for s in ships if get_dock_booking(s["id"])]
+    avg_all = round(sum(s["dwell_remaining_min"] for s in ships) / len(ships), 1) if ships else 0
+    return {"total_slots": len(list_dock_slots()), "available_slots": len(list_dock_slots(status="available")),
+            "booked_slots": len(list_dock_slots(status="booked")), "avg_dwell_remaining_min": avg_all,
+            "booked_shipments": [s["id"] for s in booked]}
+
 def fleet_analytics():
     ships = all_shipments()
     by_driver, by_vehicle = {}, {}
@@ -248,7 +379,77 @@ def shipment_detail(shipment_id):
     if not s: return None
     stops = get_stops(shipment_id)
     return {**s, "stops": stops, "route": optimise_route(stops) if stops else None,
-            "pod": get_pod(shipment_id), "notifications": list_notifications(shipment_id)}
+            "pod": get_pod(shipment_id), "notifications": list_notifications(shipment_id),
+            "dock_booking": get_dock_booking(shipment_id)}
+
+# ---------- LIVE CHATBOT (dashboard AI assistant, rule-based demo) ----------
+# Honest scope: this assistant answers from live shipment/ETA data in this
+# demo database. It is NOT an external LLM and it does NOT send real SMS,
+# email, or support tickets. A production version would plug an LLM API
+# here, with the same shipment-data tools below.
+import re
+def chat_reply(message):
+    msg = (message or "").strip()
+    low = msg.lower()
+    ships = all_shipments()
+    m = re.search(r"trk-\d+", low)
+    if m:
+        sid = m.group(0).upper()
+        s = next((x for x in ships if x["id"] == sid), None)
+        if not s:
+            return {"reply": f"I could not find {sid} in the demo fleet. Try TRK-101 to TRK-108.", "suggestions": ["Which trucks are delayed?", "What is TRK-101 ETA?", "How do I record proof of delivery?"]}
+        if not s["eta"]:
+            return {"reply": f"{sid} is delivered: {s['origin']} → {s['destination']}, driver {s['driver']}.", "shipment_id": sid}
+        e = s["eta"]
+        return {"reply": f"{sid}: {s['origin']} → {s['destination']}, driver {s['driver']} / {s['vehicle']}. Status: {s['status']}, AI status: {e['status']}. ETA in about {e['predicted_minutes']} min (window {e['window_minutes'][0]}–{e['window_minutes'][1]} min), confidence {e['confidence']}, delay probability {e['delay_probability']}. Reasons: {', '.join(e['delay_reasons'])}.", "shipment_id": sid}
+    if any(k in low for k in ("delay", "late", "at risk", "at-risk", "risk")):
+        bad = [s for s in ships if s["eta"] and s["eta"]["status"] in ("delayed", "at_risk")]
+        if not bad:
+            return {"reply": "Good news: no trucks are currently delayed or at risk in the demo fleet.", "suggestions": ["Show all shipments", "What is my on-time rate?"]}
+        lines = "; ".join(f"{s['id']} ({s['eta']['status']}, {s['eta']['predicted_minutes']} min, {', '.join(s['eta']['delay_reasons'])})" for s in bad)
+        return {"reply": f"Trucks needing attention: {lines}. Open their detail page to re-route, notify the customer, or record proof of delivery.", "suggestions": ["What is TRK-101 ETA?", "How do I record proof of delivery?"]}
+    if "on-time" in low or "on time" in low or "accuracy" in low or "mae" in low:
+        a = analytics()
+        return {"reply": f"Demo fleet: {a['total']} shipments, {a['active']} active. By AI status: {a['by_status']}. Model error on simulated demo data: {a['mae_model_min']} min vs baseline {a['mae_baseline_min']} min. This is demo data only — real accuracy must be measured on a pilot fleet.", "suggestions": ["Which trucks are delayed?", "Show fleet analytics"]}
+    if "dock" in low or "dwell" in low:
+        d = dwell_stats()
+        avail = list_dock_slots(status="available")[:3]
+        ex = ", ".join(f"{s['id']} {s['facility']} {s['slot_time']}" for s in avail)
+        return {"reply": f"Dock scheduling: {d['available_slots']} of {d['total_slots']} slots available, {d['booked_slots']} booked. Average dwell remaining is {d['avg_dwell_remaining_min']} min. Booking a slot cuts that shipment's dwell to 15 min and improves its ETA. Examples: {ex}. Open /dock to book.", "suggestions": ["Which trucks are delayed?", "What is TRK-101 ETA?"]}
+    if "pod" in low or "proof of delivery" in low or "deliver" in low and "proof" in low:
+        return {"reply": "To record proof of delivery: open a shipment detail page, fill method (signature / photo / OTP), signed-by name and OTP, then submit. It is stored and the shipment becomes delivered. Try TRK-106 — it already has a seeded POD.", "suggestions": ["What is TRK-106 status?", "Show all shipments"]}
+    if "route" in low or "optim" in low:
+        return {"reply": "Route optimisation in this demo is a nearest-first stub, not a full TSP solver: open /shipment?id=TRK-101 to see its optimised stop order. A production version would add time windows, vehicle capacity, and driver hours.", "suggestions": ["What is TRK-101 ETA?", "Which trucks are delayed?"]}
+    if "price" in low or "pricing" in low or "cost" in low:
+        return {"reply": "Pricing is intentionally not locked in this demo — test it after a pilot. The pricing page shows Starter (up to 10 vehicles), Growth (up to 50), and Scale (unlimited) tiers.", "suggestions": ["How do I use the dashboard?", "Talk to support"]}
+    if "support" in low or "human" in low or "contact" in low or "help" in low or low in ("hi", "hello", "hey"):
+        return {"reply": "Hi, I'm the Logistics AI assistant in this dashboard. I can help with shipment status, ETAs, delays, proof of delivery, routes, fleet analytics, and how to use this product. For a real human in production, this would open a support ticket — in this demo, tell me the shipment ID or issue and I'll check the live data. Try: 'Which trucks are delayed?' or 'What is TRK-101 ETA?'", "suggestions": ["Which trucks are delayed?", "What is TRK-101 ETA?", "How do I record proof of delivery?", "What is my on-time rate?"]}
+    if "how" in low or "use" in low or "dashboard" in low:
+        return {"reply": "Dashboard help: use Search and the status filter (on_time / at_risk / delayed / delivered) to find trucks. Click Detail for ETA, stops, route, POD, and notifications. Use /portal for a customer-only view, /fleet for per-driver analytics, and this chat anytime for a shipment ID.", "suggestions": ["Which trucks are delayed?", "What is TRK-101 ETA?"]}
+    if "fleet" in low or "driver" in low:
+        f = fleet_analytics()
+        drivers = ", ".join(f"{k}: {v['shipments']} shipments, {v['delivered']} delivered" for k, v in f["by_driver"].items())
+        return {"reply": f"Fleet (demo): {drivers}. Open /fleet for per-driver and per-vehicle error and on-time proxy.", "suggestions": ["Which trucks are delayed?", "What is my on-time rate?"]}
+    return {"reply": "I can help with logistics issues in this dashboard: shipment status and ETAs, delays, proof of delivery, routes, fleet analytics, and pricing. Try asking with a shipment ID, for example 'What is TRK-101 ETA?' or 'Which trucks are delayed?'", "suggestions": ["Which trucks are delayed?", "What is TRK-101 ETA?", "How do I record proof of delivery?", "What is my on-time rate?"]}
+
+CHAT_WIDGET = """
+<div class='card' id='chatbot'><h3>Live AI Chatbot — ask about any shipment or issue</h3>
+<div id='chatlog' style='border:1px solid #ddd;border-radius:8px;padding:12px;min-height:120px;max-height:300px;overflow:auto'></div>
+<p><input id='chatinput' style='width:70%' placeholder='Ask: Which trucks are delayed? / What is TRK-101 ETA?'> <button onclick='sendChat()'>Send</button></p>
+<p><small>Demo assistant: answers from live demo shipment data. Not an external LLM, not real support.</small></p>
+<script>
+async function sendChat(){
+  const inp=document.getElementById('chatinput'); const log=document.getElementById('chatlog');
+  const q=inp.value.trim(); if(!q) return;
+  log.innerHTML+='<p><b>You:</b> '+q+'</p>'; inp.value='';
+  const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:q})});
+  const d=await r.json(); log.innerHTML+='<p><b>AI:</b> '+d.reply+'</p>';
+  if(d.suggestions){ log.innerHTML+='<p><i>Try: '+d.suggestions.join(' · ')+'</i></p>'; }
+  log.scrollTop=log.scrollHeight;
+}
+document.getElementById('chatinput').addEventListener('keydown',e=>{if(e.key==='Enter') sendChat();});
+</script></div>
+"""
 
 # ---------- WEB ----------
 def page(title, body):
@@ -286,12 +487,12 @@ class H(BaseHTTPRequestHandler):
             summary = "".join(f"<div class='card'><b>{k}</b><br>{v}</div>" for k, v in [("Total", a["total"]), ("Active", a["active"]), ("Model MAE (demo)", f"{a['mae_model_min']} min"), ("Baseline MAE (demo)", f"{a['mae_baseline_min']} min")] + [(k, v) for k, v in a["by_status"].items()])
             rows = "".join(f"<tr><td>{s['id']}</td><td>{s['origin']} → {s['destination']}</td><td>{s['driver']} / {s['vehicle']}</td><td>{s['status']}</td><td>{s['eta']['predicted_minutes'] if s['eta'] else '—'} min</td><td>{s['eta']['confidence'] if s['eta'] else '—'}</td><td>{ai_status(s)}</td><td><a href='/shipment?id={s['id']}'>Detail</a> · <a href='/track?id={s['id']}'>Track</a></td></tr>" for s in ships)
             filters = "Filter: " + " ".join(f"<a href='/dashboard?status={x}'>{x}</a>" for x in ["all", "on_time", "at_risk", "delayed", "delivered"])
-            self._send(200, page("Dispatcher Dashboard", f"<div>{summary}</div><form method='get' action='/dashboard'>Search: <input name='q' value='{q.get('q',[''])[0]}'> <input type='submit' value='Search'></form><p>{filters}</p><table><tr><th>ID</th><th>Route</th><th>Driver / Vehicle</th><th>Status</th><th>ETA min</th><th>Confidence</th><th>AI status</th><th></th></tr>{rows}</table><p>Showing {len(ships)} shipment(s). Simulated demo data only.</p>"))
+            self._send(200, page("Dispatcher Dashboard", f"<div>{summary}</div><form method='get' action='/dashboard'>Search: <input name='q' value='{q.get('q',[''])[0]}'> <input type='submit' value='Search'></form><p>{filters}</p><table><tr><th>ID</th><th>Route</th><th>Driver / Vehicle</th><th>Status</th><th>ETA min</th><th>Confidence</th><th>AI status</th><th></th></tr>{rows}</table><p>Showing {len(ships)} shipment(s). Simulated demo data only.</p>{CHAT_WIDGET}"))
         elif u.path == "/shipment":
             d = shipment_detail(q.get("id", ["TRK-101"])[0])
             if not d: return self._send(404, page("Not found", "<p>Shipment not found.</p>"))
             stops = "<br>".join(f"{s['place']} — {s['miles_from_current']} mi (priority {s['priority']})" for s in d["stops"]) or "No multi-stop data"
-            route = f"<p>Optimised order (nearest-first stub): {d['route']['optimised_order'] if d['route'] else '—'}</p>" if d["route"] else ""
+            route = f"<p>Optimised order ({d['route'].get('method','nearest-first + 2-opt')}, {d['route'].get('total_miles_estimate')} mi est.): {d['route']['optimised_order'] if d['route'] else '—'}</p>" if d["route"] else ""
             pod = f"<pre>{json.dumps(d['pod'], indent=2)}</pre>" if d["pod"] else "<p>No proof of delivery yet.</p>"
             notifs = "<br>".join(f"[{n['channel']}] {n['kind']}: {n['message']}" for n in d["notifications"]) or "No notifications"
             self._send(200, page(f"Shipment {d['id']}", f"<div class='card'><p>{d['origin']} → {d['destination']} · {d['driver']} / {d['vehicle']} · {d['status']}</p><pre>{json.dumps(d['eta'], indent=2)}</pre><h3>Stops</h3><p>{stops}</p>{route}<h3>Proof of delivery</h3>{pod}<h3>Notifications</h3><p>{notifs}</p><form method='post' action='/api/pod'><input type='hidden' name='id' value='{d['id']}'><input name='method' placeholder='signature / photo / otp' value='signature'> <input name='signature_name' placeholder='Signed by'> <input name='otp' placeholder='OTP'> <input type='submit' value='Record POD (demo form)'></form></div>"))
@@ -320,6 +521,33 @@ class H(BaseHTTPRequestHandler):
             s = next((x for x in all_shipments() if x["id"] == sid), None)
             if not s: return self._send(404, page("Not found", "<p>Shipment not found.</p>"))
             self._send(200, page(f"Track {sid}", f"<div class='card'><p>{s['origin']} → {s['destination']}</p><p>Driver: {s['driver']} · Vehicle: {s['vehicle']} · Status: {s['status']}</p><pre>{json.dumps(s['eta'], indent=2)}</pre></div>"))
+        elif u.path == "/map":
+            self._send(200, page("Live Map — Routes & Status", """
+            <link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'>
+            <div id='map' style='height:520px;border-radius:12px'></div>
+            <p>Green = on time, amber = at risk, red = delayed, grey = delivered. Lines are origin → destination routes (demo cities, not live GPS tracks — live GPS needs a real telematics feed).</p>
+            <script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>
+            <script>fetch('/api/map').then(r=>r.json()).then(data=>{
+              const map=L.map('map').setView([41.0,-84.5],6);
+              L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'© OpenStreetMap'}).addTo(map);
+              const col={on_time:'green',at_risk:'orange',delayed:'red',delivered:'grey'};
+              data.forEach(s=>{ if(!s.origin_coords||!s.destination_coords) return;
+                L.marker(s.origin_coords).addTo(map).bindPopup(s.id+' origin: '+s.origin);
+                L.marker(s.destination_coords).addTo(map).bindPopup(s.id+' → '+s.destination+'<br>'+s.ai_status+'<br>ETA '+s.eta_minutes+' min');
+                L.polyline([s.origin_coords,s.destination_coords],{color:col[s.ai_status]||'blue'}).addTo(map); });
+            });</script>"""))
+        elif u.path == "/briefing":
+            b = dispatcher_briefing()
+            acts = "<br>".join(b["recommended_actions"])
+            self._send(200, page("AI Dispatcher Briefing", f"<div class='card'><p>{b['summary']}</p><p>Top delay reasons: {b['top_delay_reasons']}</p><h3>Recommended actions</h3><p>{acts}</p><p><a href='/map'>Open live map →</a> · <a href='/chat'>Ask the chatbot →</a></p></div>"))
+        elif u.path == "/dock":
+            d = dwell_stats()
+            rows = "".join(f"<tr><td>{s['id']}</td><td>{s['facility']}</td><td>{s['dock_door']}</td><td>{s['slot_time']}</td><td>{s['status']}</td><td>{s['shipment_id'] or '—'}</td></tr>" for s in list_dock_slots())
+            self._send(200, page("Dock Scheduling & Dwell Time", f"<div class='card'><p>Available: {d['available_slots']} / {d['total_slots']} · Booked: {d['booked_slots']} · Avg dwell remaining: {d['avg_dwell_remaining_min']} min</p><p>Booking a slot cuts that shipment's dwell to 15 min and improves its ETA.</p><p>Book: <input id='slot' placeholder='DOCK-COLUMBUS-1'> <input id='ship' placeholder='TRK-101'> <button onclick=\"fetch('/api/dock/book',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{slot_id:document.getElementById('slot').value,shipment_id:document.getElementById('ship').value}})}}).then(r=>r.json()).then(x=>alert(JSON.stringify(x))).then(()=>location.reload())\">Book slot</button></p></div><table><tr><th>Slot</th><th>Facility</th><th>Door</th><th>Time</th><th>Status</th><th>Shipment</th></tr>{rows}</table>"))
+        elif u.path == "/chat":
+            self._send(200, page("Live AI Chatbot", CHAT_WIDGET + "<p>Ask about any shipment, delay, ETA, POD, route, or fleet issue. The bot answers from live demo data.</p>"))
+        elif u.path == "/mobile":
+            self._send(200, page("Mobile App", "<p>Mobile web app: open this SaaS on iOS or Android in a browser — the dashboard, tracking, and chatbot are responsive. Native iOS (SwiftUI) and Android (Kotlin) skeletons are in mobile/ios/ and mobile/android/ in the repo, ready to open in Xcode / Android Studio and point at this API.</p><p><a href='/dashboard'>Open dashboard →</a> · <a href='/chat'>Open chatbot →</a></p>"))
         elif u.path == "/api/shipments":
             self._send(200, json.dumps(all_shipments(), indent=2), "application/json")
         elif u.path == "/api/eta":
@@ -344,10 +572,26 @@ class H(BaseHTTPRequestHandler):
             self._send(200, json.dumps(list_notifications(q.get("id", [None])[0]), indent=2), "application/json")
         elif u.path == "/api/fleet":
             self._send(200, json.dumps(fleet_analytics(), indent=2), "application/json")
+        elif u.path == "/api/map":
+            self._send(200, json.dumps(map_data(), indent=2), "application/json")
+        elif u.path == "/api/briefing":
+            self._send(200, json.dumps(dispatcher_briefing(), indent=2), "application/json")
+        elif u.path == "/api/dock":
+            self._send(200, json.dumps({"slots": list_dock_slots(), "stats": dwell_stats()}, indent=2), "application/json")
         else:
             self._send(404, page("Not found", "<p>Try /dashboard</p>"))
     def do_POST(self):
-        if self.path == "/api/pod":
+        if self.path == "/api/dock/book":
+            n = int(self.headers.get("Content-Length", 0)); data = json.loads(self.rfile.read(n) or b"{}")
+            self._send(200, json.dumps(book_dock_slot(data.get("slot_id", ""), data.get("shipment_id", "")), indent=2), "application/json")
+        elif self.path == "/api/notify":
+            n = int(self.headers.get("Content-Length", 0)); data = json.loads(self.rfile.read(n) or b"{}")
+            r = send_notification(data.get("id", "TRK-101"), data.get("channel", "sms"), data.get("message", "Update on your delivery."))
+            self._send(200, json.dumps(r, indent=2), "application/json")
+        elif self.path == "/api/chat":
+            n = int(self.headers.get("Content-Length", 0)); data = json.loads(self.rfile.read(n) or b"{}")
+            self._send(200, json.dumps(chat_reply(data.get("message", "")), indent=2), "application/json")
+        elif self.path == "/api/pod":
             n = int(self.headers.get("Content-Length", 0)); raw = self.rfile.read(n).decode()
             data = parse_qs(raw)
             pod = record_pod(data.get("id", ["TRK-101"])[0], data.get("method", ["signature"])[0],
@@ -366,4 +610,7 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     init_db()
     print("Logistics AI SaaS running at http://localhost:8000/  (Ctrl-C to stop)")
-    HTTPServer(("127.0.0.1", 8000), H).serve_forever()
+    print("LAN: also reachable at http://<your-Mac-LAN-IP>:8000/ for a phone on the same Wi-Fi.")
+    # 0.0.0.0 = LAN-reachable (same Wi-Fi only, not the public internet).
+    # For phone-only local use, 127.0.0.1 would block the phone, so use 0.0.0.0.
+    HTTPServer(("0.0.0.0", 8000), H).serve_forever()
