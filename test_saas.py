@@ -1,7 +1,7 @@
 """Tests for the SaaS ETA model. Run: python3 test_saas.py"""
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
-from app import predict_eta, optimise_route, record_pod, get_pod, fleet_analytics, list_notifications, init_db, shipment_detail, chat_reply, map_data, dispatcher_briefing, send_notification, list_dock_slots, book_dock_slot, dwell_stats
+from app import predict_eta, optimise_route, record_pod, get_pod, fleet_analytics, list_notifications, init_db, shipment_detail, chat_reply, map_data, dispatcher_briefing, send_notification, list_dock_slots, book_dock_slot, dwell_stats, forecast_demand, demand_history
 
 def base(**kw):
     d = {"id": "TRK-TEST", "remaining_miles": 100, "speed_mph": 55,
@@ -89,7 +89,26 @@ def test_dock_scheduling():
     assert dwell_stats()["booked_slots"] == 1
     print("dock scheduling OK", r)
 
+def test_demand_forecasting():
+    init_db()
+    h = demand_history()
+    assert len(h) == 64  # 8 lanes x 8 weeks of seeded history
+    f = forecast_demand()
+    assert f["forecast_week_start"] == "2026-11-09"
+    assert len(f["lanes"]) == 8
+    assert f["total_trucks_next_week"] == 80  # 16+10+13+8+7+11+6+9
+    chi = next(x for x in f["lanes"] if x["lane"] == "Columbus, OH → Chicago, IL")
+    assert chi["history"] == [12, 13, 12, 14, 13, 15, 14, 16]
+    assert chi["avg_last_4_weeks"] == 14.5 and chi["forecast_trucks_next_week"] == 16
+    assert chi["direction"] == "up" and 0.5 <= chi["confidence"] <= 0.95
+    assert "Plan 16 truck(s)" in chi["recommendation"]
+    one = forecast_demand("Columbus, OH → Cleveland, OH")
+    assert len(one["lanes"]) == 1 and one["lanes"][0]["forecast_trucks_next_week"] == 10
+    r = chat_reply("What is the demand forecast for next week?")
+    assert "80" in r["reply"] or "trucks" in r["reply"].lower()
+    print("demand forecasting OK", f["total_trucks_next_week"], "trucks;", chi)
+
 if __name__ == "__main__":
     test_window_and_confidence(); test_traffic_slows_eta(); test_stale_gps_lowers_confidence(); test_delay_flag()
-    test_route_optimisation(); test_pod_and_detail(); test_notifications_and_fleet(); test_chatbot(); test_map_briefing_notify(); test_dock_scheduling()
-    print("All 10 tests passed.")
+    test_route_optimisation(); test_pod_and_detail(); test_notifications_and_fleet(); test_chatbot(); test_map_briefing_notify(); test_dock_scheduling(); test_demand_forecasting()
+    print("All 11 tests passed.")
