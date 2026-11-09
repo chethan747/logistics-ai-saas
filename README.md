@@ -31,9 +31,11 @@ python3 test_saas.py
 - `POST /api/notify` — `{"id":"TRK-101","channel":"sms","message":"..."}` — Twilio-ready: sends real SMS only if TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM and NOTIFY_TO are set; otherwise logs only and reports sent=false
 - Route optimisation upgraded from nearest-first stub to nearest-first + 2-opt (heuristic, not exact TSP; no time windows/capacity yet)
 - `/dock` + `POST /api/dock/book` — dock scheduling & dwell time: 20 slots (Columbus/Chicago/Detroit/Cincinnati, 2026-11-09), booking cuts dwell to 15 min and improves ETA
+- `/forecast` + `GET /api/forecast` (+ `?lane=...`) — demand forecasting: weekly truck need by lane from 8 weeks of seeded demo history — 4-week moving average + trend, confidence from week-to-week variability; 80 trucks total for the week of 2026-11-09 across 8 lanes. Seeded history only, not real bookings — re-fit on real order history before capacity decisions
 
 ## Pages
 - `/dashboard` — summary cards, search, filter by AI status, shipment table
+- `/forecast` — demand forecast: weekly truck need by lane, history, trend, confidence, recommendations
 - `/shipment?id=TRK-101` — detail view
 - `/portal` — customer portal (routes, status, ETA windows only)
 - `/fleet`, `/notifications`, `/analytics`, `/pricing`
