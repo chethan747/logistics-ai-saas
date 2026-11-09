@@ -169,6 +169,7 @@ def init_v2_tables(con=None):
     c.execute("""CREATE TABLE IF NOT EXISTS dock_slots
         (id TEXT PRIMARY KEY, facility TEXT, dock_door TEXT, slot_time TEXT, status TEXT, shipment_id TEXT)""")
     c.execute("DELETE FROM stops"); c.execute("DELETE FROM notifications"); c.execute("DELETE FROM dock_slots")
+    seed_demand_history(con)
     dock = []
     for facility, door in [("Columbus DC", "A1"), ("Chicago DC", "B1"), ("Detroit DC", "C1"), ("Cincinnati DC", "D1")]:
         for i, t in enumerate(["08:00", "10:00", "12:00", "14:00", "16:00"]):
@@ -356,6 +357,86 @@ def dwell_stats():
             "booked_slots": len(list_dock_slots(status="booked")), "avg_dwell_remaining_min": avg_all,
             "booked_shipments": [s["id"] for s in booked]}
 
+# ---------- DEMAND FORECASTING (weekly truck need by lane, seeded history) ----------
+# Honest scope: forecasts are a 4-week moving average + trend on SEEDED
+# demo history (8 weeks, invented for the demo). They are NOT trained on
+# real bookings and must be re-fit on real order history before any
+# capacity or hiring decision. Forecast week is the Monday after the
+# last seeded week.
+DEMAND_WEEKS = ["2026-09-14", "2026-09-21", "2026-09-28", "2026-10-05",
+                "2026-10-12", "2026-10-19", "2026-10-26", "2026-11-02"]
+DEMAND_FORECAST_WEEK = "2026-11-09"
+DEMAND_SEED = {
+    "Columbus, OH → Chicago, IL":     [12, 13, 12, 14, 13, 15, 14, 16],
+    "Columbus, OH → Cleveland, OH":   [8, 9, 8, 9, 10, 9, 10, 10],
+    "Chicago, IL → Detroit, MI":      [10, 10, 11, 10, 12, 11, 12, 13],
+    "Columbus, OH → Cincinnati, OH":  [6, 7, 6, 7, 7, 8, 7, 8],
+    "Indianapolis, IN → Columbus, OH": [5, 5, 6, 5, 6, 6, 7, 6],
+    "Chicago, IL → Columbus, OH":     [9, 9, 10, 9, 10, 11, 10, 11],
+    "Detroit, MI → Cleveland, OH":    [4, 4, 5, 4, 5, 5, 5, 6],
+    "Columbus, OH → Pittsburgh, PA":  [7, 7, 8, 7, 8, 9, 8, 9],
+}
+
+def seed_demand_history(con):
+    c = con.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS demand_history
+        (lane TEXT, week_start TEXT, trucks INTEGER)""")
+    c.execute("DELETE FROM demand_history")
+    for lane, weeks in DEMAND_SEED.items():
+        for wk, n in zip(DEMAND_WEEKS, weeks):
+            c.execute("INSERT INTO demand_history VALUES (?,?,?)", (lane, wk, n))
+
+def demand_history(lane=None):
+    con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
+    q = "SELECT lane, week_start, trucks FROM demand_history ORDER BY lane, week_start"
+    args = ()
+    if lane:
+        q = "SELECT lane, week_start, trucks FROM demand_history WHERE lane=? ORDER BY week_start"
+        args = (lane,)
+    rows = [dict(r) for r in con.execute(q, args)]
+    con.close()
+    return rows
+
+def forecast_demand(lane=None):
+    """Forecast next week's truck need per lane: 4-week moving average
+    plus the recent trend (last week minus first of the last 4, per week),
+    rounded up to whole trucks. Confidence falls as week-to-week
+    variability rises. Seeded demo history only — see DEMAND_SEED."""
+    rows = demand_history(lane)
+    by_lane = {}
+    for r in rows:
+        by_lane.setdefault(r["lane"], []).append(r["trucks"])
+    out = []
+    for lane_name, weeks in sorted(by_lane.items()):
+        if len(weeks) < 4:
+            continue
+        last4 = weeks[-4:]
+        avg = sum(last4) / len(last4)
+        trend = (last4[-1] - last4[0]) / 3.0
+        forecast = max(1, math.ceil(avg + trend))
+        mean = avg
+        var = sum((x - mean) ** 2 for x in last4) / len(last4)
+        cv = (math.sqrt(var) / mean) if mean else 0
+        confidence = round(clamp(0.95 - cv, 0.5, 0.95), 2)
+        direction = "up" if trend > 0.5 else ("down" if trend < -0.5 else "flat")
+        out.append({
+            "lane": lane_name,
+            "forecast_week_start": DEMAND_FORECAST_WEEK,
+            "history_weeks": len(weeks),
+            "history": weeks,
+            "avg_last_4_weeks": round(avg, 1),
+            "trend_per_week": round(trend, 2),
+            "forecast_trucks_next_week": forecast,
+            "confidence": confidence,
+            "confidence_label": "high" if cv < 0.1 else ("medium" if cv < 0.2 else "low"),
+            "direction": direction,
+            "recommendation": f"Plan {forecast} truck(s) on {lane_name} for the week of {DEMAND_FORECAST_WEEK} ({direction} vs recent average {round(avg, 1)}).",
+        })
+    total = sum(f["forecast_trucks_next_week"] for f in out)
+    return {"forecast_week_start": DEMAND_FORECAST_WEEK, "total_trucks_next_week": total,
+            "lanes": out, "method": "4-week moving average + trend, on seeded demo history — not real bookings",
+            "note": "Demo forecast from seeded history only. Re-fit on real order history before capacity decisions."}
+
 def fleet_analytics():
     ships = all_shipments()
     by_driver, by_vehicle = {}, {}
@@ -411,6 +492,11 @@ def chat_reply(message):
     if "on-time" in low or "on time" in low or "accuracy" in low or "mae" in low:
         a = analytics()
         return {"reply": f"Demo fleet: {a['total']} shipments, {a['active']} active. By AI status: {a['by_status']}. Model error on simulated demo data: {a['mae_model_min']} min vs baseline {a['mae_baseline_min']} min. This is demo data only — real accuracy must be measured on a pilot fleet.", "suggestions": ["Which trucks are delayed?", "Show fleet analytics"]}
+    if "forecast" in low or "demand" in low or "next week" in low:
+        f = forecast_demand()
+        top = sorted(f["lanes"], key=lambda x: -x["forecast_trucks_next_week"])[:3]
+        ex = "; ".join(f"{x['lane']}: {x['forecast_trucks_next_week']} trucks ({x['direction']}, confidence {x['confidence']})" for x in top)
+        return {"reply": f"Demand forecast for the week of {f['forecast_week_start']}: {f['total_trucks_next_week']} trucks total across {len(f['lanes'])} lanes. Top lanes: {ex}. This is a demo forecast from seeded history, not real bookings — open /forecast for the full breakdown.", "suggestions": ["Which trucks are delayed?", "What is TRK-101 ETA?"]}
     if "dock" in low or "dwell" in low:
         d = dwell_stats()
         avail = list_dock_slots(status="available")[:3]
@@ -460,7 +546,7 @@ def page(title, body):
     .card{{border:1px solid #ddd;border-radius:12px;padding:16px;margin:12px 0}}
     a{{color:#0b5fff}} .pill{{padding:2px 8px;border-radius:999px;background:#eef2ff}}
     </style></head><body><h1>{title}</h1>{body}
-    <p><a href='/'>Home</a> · <a href='/dashboard'>Dashboard</a> · <a href='/portal'>Customer Portal</a> · <a href='/analytics'>Analytics</a> · <a href='/fleet'>Fleet</a> · <a href='/notifications'>Notifications</a> · <a href='/pricing'>Pricing</a> · <a href='/api/shipments'>API JSON</a></p>
+    <p><a href='/'>Home</a> · <a href='/dashboard'>Dashboard</a> · <a href='/portal'>Customer Portal</a> · <a href='/analytics'>Analytics</a> · <a href='/fleet'>Fleet</a> · <a href='/forecast'>Demand Forecast</a> · <a href='/notifications'>Notifications</a> · <a href='/pricing'>Pricing</a> · <a href='/api/shipments'>API JSON</a></p>
     <p><small>Demo SaaS — simulated data, demo logins only. Not production, no real payments or GPS.</small></p></body></html>"""
 
 class H(BaseHTTPRequestHandler):
@@ -476,7 +562,7 @@ class H(BaseHTTPRequestHandler):
             <p><a href='/dashboard'>Open dispatcher dashboard →</a></p></div>
             <div class='card'><h3>SaaS modules</h3><ul>
             <li>Shipments & live tracking</li><li>AI ETA + delay risk</li><li>Alerts & customer portal</li>
-            <li>Proof of delivery · Route optimisation (nearest-first stub) · Fleet analytics · Notifications log · Customer portal</li></ul></div>"""))
+            <li>Proof of delivery · Route optimisation (nearest-first + 2-opt) · Fleet analytics · Notifications log · Customer portal · Dock scheduling · <a href='/forecast'>Demand forecasting</a></li></ul></div>"""))
         elif u.path == "/dashboard":
             a = analytics()
             filt = q.get("status", ["all"])[0]; search = q.get("q", [""])[0].lower()
@@ -544,6 +630,11 @@ class H(BaseHTTPRequestHandler):
             d = dwell_stats()
             rows = "".join(f"<tr><td>{s['id']}</td><td>{s['facility']}</td><td>{s['dock_door']}</td><td>{s['slot_time']}</td><td>{s['status']}</td><td>{s['shipment_id'] or '—'}</td></tr>" for s in list_dock_slots())
             self._send(200, page("Dock Scheduling & Dwell Time", f"<div class='card'><p>Available: {d['available_slots']} / {d['total_slots']} · Booked: {d['booked_slots']} · Avg dwell remaining: {d['avg_dwell_remaining_min']} min</p><p>Booking a slot cuts that shipment's dwell to 15 min and improves its ETA.</p><p>Book: <input id='slot' placeholder='DOCK-COLUMBUS-1'> <input id='ship' placeholder='TRK-101'> <button onclick=\"fetch('/api/dock/book',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{slot_id:document.getElementById('slot').value,shipment_id:document.getElementById('ship').value}})}}).then(r=>r.json()).then(x=>alert(JSON.stringify(x))).then(()=>location.reload())\">Book slot</button></p></div><table><tr><th>Slot</th><th>Facility</th><th>Door</th><th>Time</th><th>Status</th><th>Shipment</th></tr>{rows}</table>"))
+        elif u.path == "/forecast":
+            f = forecast_demand()
+            rows = "".join(f"<tr><td>{x['lane']}</td><td>{', '.join(str(v) for v in x['history'])}</td><td>{x['avg_last_4_weeks']}</td><td>{x['trend_per_week']:+.2f}</td><td><b>{x['forecast_trucks_next_week']}</b></td><td>{x['confidence']} ({x['confidence_label']})</td><td>{x['direction']}</td></tr>" for x in f["lanes"])
+            recs = "<br>".join(x["recommendation"] for x in f["lanes"])
+            self._send(200, page("Demand Forecast — Weekly Truck Need by Lane", f"<div class='card'><p>Forecast week starting <b>{f['forecast_week_start']}</b> · Total trucks needed: <b>{f['total_trucks_next_week']}</b> across {len(f['lanes'])} lanes</p><p>Method: {f['method']}.</p><p><small>{f['note']}</small></p></div><table><tr><th>Lane</th><th>History (trucks/week, 8 wks)</th><th>Avg last 4 wks</th><th>Trend / wk</th><th>Forecast trucks</th><th>Confidence</th><th>Direction</th></tr>{rows}</table><div class='card'><h3>Recommendations</h3><p>{recs}</p></div>"))
         elif u.path == "/chat":
             self._send(200, page("Live AI Chatbot", CHAT_WIDGET + "<p>Ask about any shipment, delay, ETA, POD, route, or fleet issue. The bot answers from live demo data.</p>"))
         elif u.path == "/mobile":
@@ -578,6 +669,9 @@ class H(BaseHTTPRequestHandler):
             self._send(200, json.dumps(dispatcher_briefing(), indent=2), "application/json")
         elif u.path == "/api/dock":
             self._send(200, json.dumps({"slots": list_dock_slots(), "stats": dwell_stats()}, indent=2), "application/json")
+        elif u.path == "/api/forecast":
+            lane = q.get("lane", [None])[0]
+            self._send(200, json.dumps(forecast_demand(lane), indent=2), "application/json")
         else:
             self._send(404, page("Not found", "<p>Try /dashboard</p>"))
     def do_POST(self):
