@@ -170,6 +170,7 @@ def init_v2_tables(con=None):
         (id TEXT PRIMARY KEY, facility TEXT, dock_door TEXT, slot_time TEXT, status TEXT, shipment_id TEXT)""")
     c.execute("DELETE FROM stops"); c.execute("DELETE FROM notifications"); c.execute("DELETE FROM dock_slots")
     seed_demand_history(con)
+    seed_safety_events(con)
     dock = []
     for facility, door in [("Columbus DC", "A1"), ("Chicago DC", "B1"), ("Detroit DC", "C1"), ("Cincinnati DC", "D1")]:
         for i, t in enumerate(["08:00", "10:00", "12:00", "14:00", "16:00"]):
@@ -437,6 +438,94 @@ def forecast_demand(lane=None):
             "lanes": out, "method": "4-week moving average + trend, on seeded demo history — not real bookings",
             "note": "Demo forecast from seeded history only. Re-fit on real order history before capacity decisions."}
 
+# ---------- DRIVER SAFETY SCORE (harsh braking / speeding / idle proxy) ----------
+# Honest scope: scores are computed from SEEDED demo telematics-style
+# event counts (last 30 days, invented for the demo). They are NOT from a
+# real telematics feed or dashcam — a production version would ingest
+# real harsh-braking / speeding / idle events per driver and calibrate
+# the weights on real incident data.
+SAFETY_PERIOD_DAYS = 30
+SAFETY_SEED = {
+    # driver: (miles_driven, harsh_braking_events, speeding_events, long_idle_events)
+    "A. Kumar":  (2400, 3, 2, 4),
+    "M. Lee":    (1800, 5, 4, 6),
+    "S. Patel":  (2100, 12, 9, 10),
+    "J. Smith":  (1500, 4, 3, 3),
+    "R. Davis":  (2600, 6, 5, 8),
+    "T. Nguyen": (1200, 12, 9, 14),
+    "K. Jones":  (1900, 16, 12, 9),
+    "L. Brown":  (900, 14, 11, 15),
+}
+# Points deducted per event per 100 miles driven.
+SAFETY_WEIGHTS = {"harsh_braking": 15.0, "speeding": 10.0, "long_idle": 5.0}
+
+def seed_safety_events(con):
+    c = con.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS safety_events
+        (driver TEXT, miles_driven REAL, harsh_braking INTEGER,
+         speeding INTEGER, long_idle INTEGER)""")
+    c.execute("DELETE FROM safety_events")
+    for driver, (miles, harsh, speeding, idle) in SAFETY_SEED.items():
+        c.execute("INSERT INTO safety_events VALUES (?,?,?,?,?)",
+                  (driver, miles, harsh, speeding, idle))
+
+def safety_events(driver=None):
+    con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
+    q = "SELECT * FROM safety_events ORDER BY driver"
+    args = ()
+    if driver:
+        q = "SELECT * FROM safety_events WHERE driver=? ORDER BY driver"
+        args = (driver,)
+    rows = [dict(r) for r in con.execute(q, args)]
+    con.close()
+    return rows
+
+def safety_band(score):
+    if score >= 90: return "Excellent"
+    if score >= 75: return "Good"
+    if score >= 60: return "Fair"
+    return "At risk"
+
+def driver_safety_scores(driver=None):
+    """Per-driver safety score 0-100 from seeded event counts.
+    Score = 100 - weighted event rates per 100 miles. Higher is safer.
+    Seeded demo data only — see SAFETY_SEED."""
+    out = []
+    for r in safety_events(driver):
+        miles = float(r["miles_driven"]) or 1
+        per100 = {k: r[k] / miles * 100 for k in ("harsh_braking", "speeding", "long_idle")}
+        deductions = {k: round(SAFETY_WEIGHTS[k] * per100[k], 2) for k in per100}
+        score = round(clamp(100 - sum(deductions.values()), 0, 100), 1)
+        worst = max(deductions, key=deductions.get)
+        coaching = {
+            "harsh_braking": "Coach smooth braking: increase following distance and brake early.",
+            "speeding": "Coach speed compliance: watch speed limits on highway stretches.",
+            "long_idle": "Coach idle reduction: switch off during long waits at docks.",
+        }[worst]
+        out.append({
+            "driver": r["driver"],
+            "period_days": SAFETY_PERIOD_DAYS,
+            "miles_driven": r["miles_driven"],
+            "harsh_braking_events": r["harsh_braking"],
+            "speeding_events": r["speeding"],
+            "long_idle_events": r["long_idle"],
+            "harsh_braking_per_100mi": round(per100["harsh_braking"], 2),
+            "speeding_per_100mi": round(per100["speeding"], 2),
+            "long_idle_per_100mi": round(per100["long_idle"], 2),
+            "deductions": deductions,
+            "safety_score": score,
+            "band": safety_band(score),
+            "top_risk_factor": worst,
+            "recommendation": coaching if score < 90 else "Keep it up — no coaching needed this period.",
+        })
+    out.sort(key=lambda x: -x["safety_score"])
+    avg = round(sum(d["safety_score"] for d in out) / len(out), 1) if out else 0
+    return {"period_days": SAFETY_PERIOD_DAYS,
+            "fleet_average_score": avg,
+            "drivers": out,
+            "method": "100 - 15*harsh + 10*speeding + 5*idle events per 100 miles, on seeded demo event counts — not real telematics",
+            "note": "Demo safety scores from seeded event counts only. Connect a real telematics feed before using scores for coaching or insurance decisions."}
+
 def fleet_analytics():
     ships = all_shipments()
     by_driver, by_vehicle = {}, {}
@@ -512,6 +601,10 @@ def chat_reply(message):
         return {"reply": "Hi, I'm the Logistics AI assistant in this dashboard. I can help with shipment status, ETAs, delays, proof of delivery, routes, fleet analytics, and how to use this product. For a real human in production, this would open a support ticket — in this demo, tell me the shipment ID or issue and I'll check the live data. Try: 'Which trucks are delayed?' or 'What is TRK-101 ETA?'", "suggestions": ["Which trucks are delayed?", "What is TRK-101 ETA?", "How do I record proof of delivery?", "What is my on-time rate?"]}
     if "how" in low or "use" in low or "dashboard" in low:
         return {"reply": "Dashboard help: use Search and the status filter (on_time / at_risk / delayed / delivered) to find trucks. Click Detail for ETA, stops, route, POD, and notifications. Use /portal for a customer-only view, /fleet for per-driver analytics, and this chat anytime for a shipment ID.", "suggestions": ["Which trucks are delayed?", "What is TRK-101 ETA?"]}
+    if "safety" in low or "safe driving" in low:
+        s = driver_safety_scores()
+        best, worst = s["drivers"][0], s["drivers"][-1]
+        return {"reply": f"Driver safety (last {s['period_days']} days, seeded demo data): fleet average {s['fleet_average_score']}. Best: {best['driver']} at {best['safety_score']} ({best['band']}). Needs coaching: {worst['driver']} at {worst['safety_score']} ({worst['band']}) — {worst['recommendation']} Open /safety for the full table.", "suggestions": ["Which trucks are delayed?", "What is my on-time rate?"]}
     if "fleet" in low or "driver" in low:
         f = fleet_analytics()
         drivers = ", ".join(f"{k}: {v['shipments']} shipments, {v['delivered']} delivered" for k, v in f["by_driver"].items())
@@ -546,7 +639,7 @@ def page(title, body):
     .card{{border:1px solid #ddd;border-radius:12px;padding:16px;margin:12px 0}}
     a{{color:#0b5fff}} .pill{{padding:2px 8px;border-radius:999px;background:#eef2ff}}
     </style></head><body><h1>{title}</h1>{body}
-    <p><a href='/'>Home</a> · <a href='/dashboard'>Dashboard</a> · <a href='/portal'>Customer Portal</a> · <a href='/analytics'>Analytics</a> · <a href='/fleet'>Fleet</a> · <a href='/forecast'>Demand Forecast</a> · <a href='/notifications'>Notifications</a> · <a href='/pricing'>Pricing</a> · <a href='/api/shipments'>API JSON</a></p>
+    <p><a href='/'>Home</a> · <a href='/dashboard'>Dashboard</a> · <a href='/portal'>Customer Portal</a> · <a href='/analytics'>Analytics</a> · <a href='/fleet'>Fleet</a> · <a href='/forecast'>Demand Forecast</a> · <a href='/safety'>Driver Safety</a> · <a href='/notifications'>Notifications</a> · <a href='/pricing'>Pricing</a> · <a href='/api/shipments'>API JSON</a></p>
     <p><small>Demo SaaS — simulated data, demo logins only. Not production, no real payments or GPS.</small></p></body></html>"""
 
 class H(BaseHTTPRequestHandler):
@@ -562,7 +655,7 @@ class H(BaseHTTPRequestHandler):
             <p><a href='/dashboard'>Open dispatcher dashboard →</a></p></div>
             <div class='card'><h3>SaaS modules</h3><ul>
             <li>Shipments & live tracking</li><li>AI ETA + delay risk</li><li>Alerts & customer portal</li>
-            <li>Proof of delivery · Route optimisation (nearest-first + 2-opt) · Fleet analytics · Notifications log · Customer portal · Dock scheduling · <a href='/forecast'>Demand forecasting</a></li></ul></div>"""))
+            <li>Proof of delivery · Route optimisation (nearest-first + 2-opt) · Fleet analytics · Notifications log · Customer portal · Dock scheduling · <a href='/forecast'>Demand forecasting</a> · <a href='/safety'>Driver safety score</a></li></ul></div>"""))
         elif u.path == "/dashboard":
             a = analytics()
             filt = q.get("status", ["all"])[0]; search = q.get("q", [""])[0].lower()
@@ -635,6 +728,12 @@ class H(BaseHTTPRequestHandler):
             rows = "".join(f"<tr><td>{x['lane']}</td><td>{', '.join(str(v) for v in x['history'])}</td><td>{x['avg_last_4_weeks']}</td><td>{x['trend_per_week']:+.2f}</td><td><b>{x['forecast_trucks_next_week']}</b></td><td>{x['confidence']} ({x['confidence_label']})</td><td>{x['direction']}</td></tr>" for x in f["lanes"])
             recs = "<br>".join(x["recommendation"] for x in f["lanes"])
             self._send(200, page("Demand Forecast — Weekly Truck Need by Lane", f"<div class='card'><p>Forecast week starting <b>{f['forecast_week_start']}</b> · Total trucks needed: <b>{f['total_trucks_next_week']}</b> across {len(f['lanes'])} lanes</p><p>Method: {f['method']}.</p><p><small>{f['note']}</small></p></div><table><tr><th>Lane</th><th>History (trucks/week, 8 wks)</th><th>Avg last 4 wks</th><th>Trend / wk</th><th>Forecast trucks</th><th>Confidence</th><th>Direction</th></tr>{rows}</table><div class='card'><h3>Recommendations</h3><p>{recs}</p></div>"))
+        elif u.path == "/safety":
+            s = driver_safety_scores()
+            rows = "".join(f"<tr><td>{i+1}</td><td>{d['driver']}</td><td>{d['miles_driven']}</td><td>{d['harsh_braking_events']} ({d['harsh_braking_per_100mi']}/100mi)</td><td>{d['speeding_events']} ({d['speeding_per_100mi']}/100mi)</td><td>{d['long_idle_events']} ({d['long_idle_per_100mi']}/100mi)</td><td><b>{d['safety_score']}</b></td><td>{d['band']}</td><td>{d['top_risk_factor']}</td><td>{d['recommendation']}</td></tr>" for i, d in enumerate(s["drivers"]))
+            at_risk = [d for d in s["drivers"] if d["band"] == "At risk"]
+            warn = f"<p><b>Needs coaching:</b> {', '.join(d['driver'] for d in at_risk)}.</p>" if at_risk else "<p>No driver is currently At risk.</p>"
+            self._send(200, page("Driver Safety Score", f"<div class='card'><p>Last {s['period_days']} days (seeded demo event counts) · Fleet average score: <b>{s['fleet_average_score']}</b></p><p>Method: {s['method']}.</p><p><small>{s['note']}</small></p>{warn}</div><table><tr><th>#</th><th>Driver</th><th>Miles</th><th>Harsh braking</th><th>Speeding</th><th>Long idle</th><th>Score</th><th>Band</th><th>Top risk</th><th>Recommendation</th></tr>{rows}</table>"))
         elif u.path == "/chat":
             self._send(200, page("Live AI Chatbot", CHAT_WIDGET + "<p>Ask about any shipment, delay, ETA, POD, route, or fleet issue. The bot answers from live demo data.</p>"))
         elif u.path == "/mobile":
@@ -672,6 +771,9 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/api/forecast":
             lane = q.get("lane", [None])[0]
             self._send(200, json.dumps(forecast_demand(lane), indent=2), "application/json")
+        elif u.path == "/api/safety":
+            drv = q.get("driver", [None])[0]
+            self._send(200, json.dumps(driver_safety_scores(drv), indent=2), "application/json")
         else:
             self._send(404, page("Not found", "<p>Try /dashboard</p>"))
     def do_POST(self):
