@@ -32,10 +32,12 @@ python3 test_saas.py
 - Route optimisation upgraded from nearest-first stub to nearest-first + 2-opt (heuristic, not exact TSP; no time windows/capacity yet)
 - `/dock` + `POST /api/dock/book` — dock scheduling & dwell time: 20 slots (Columbus/Chicago/Detroit/Cincinnati, 2026-11-09), booking cuts dwell to 15 min and improves ETA
 - `/forecast` + `GET /api/forecast` (+ `?lane=...`) — demand forecasting: weekly truck need by lane from 8 weeks of seeded demo history — 4-week moving average + trend, confidence from week-to-week variability; 80 trucks total for the week of 2026-11-09 across 8 lanes. Seeded history only, not real bookings — re-fit on real order history before capacity decisions
+- `/safety` + `GET /api/safety` (+ `?driver=...`) — driver safety score: per-driver 0–100 score from seeded harsh-braking / speeding / idle event rates per 100 miles (last 30 days) — weights 15/10/5, bands Excellent ≥90 / Good ≥75 / Fair ≥60 / At risk <60, with top risk factor and coaching recommendation per driver; fleet average 83.2, best A. Kumar 96.5, worst L. Brown 56.1 (At risk). Seeded demo event counts only, not real telematics — connect a real telematics feed before using scores for coaching or insurance decisions
 
 ## Pages
 - `/dashboard` — summary cards, search, filter by AI status, shipment table
 - `/forecast` — demand forecast: weekly truck need by lane, history, trend, confidence, recommendations
+- `/safety` — driver safety score: per-driver score, band, event rates, coaching recommendation
 - `/shipment?id=TRK-101` — detail view
 - `/portal` — customer portal (routes, status, ETA windows only)
 - `/fleet`, `/notifications`, `/analytics`, `/pricing`
@@ -59,6 +61,8 @@ admin@demo.local, dispatcher@demo.local, driver@demo.local, customer@demo.local
 6. Analytics (counts, status, demo MAE vs baseline) + fleet analytics
 7. v2, working in demo form: route optimisation (nearest-first + 2-opt),
    proof of delivery records, notifications log, shipment detail view
+8. Driver safety score (per-driver 0–100 from seeded harsh-braking /
+   speeding / idle rates per 100 miles, bands + coaching recommendations)
 
 ## Next steps to make it production
 1. Replace simulated seed with a pilot fleet GPS feed.
