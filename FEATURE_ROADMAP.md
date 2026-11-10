@@ -13,17 +13,17 @@ GitHub Contents API (no git CLI push).
 - 2026-11-02 — v3 live map (`/map`), route optimisation nearest-first + 2-opt, AI dispatcher briefing (`/briefing`), Twilio-ready notifications (`POST /api/notify`)
 - 2026-11-08 — Dock scheduling + dwell time (`/dock`, `POST /api/dock/book`): booking a slot cuts dwell to 15 min and improves ETA
 - 2026-11-09 — Demand forecasting (`/forecast`, `GET /api/forecast`): weekly truck need by lane from 8 weeks of seeded history — 4-week moving average + trend, 80 trucks total for week of 2026-11-09 across 8 lanes
+- 2026-11-10 — Driver safety score (`/safety`, `GET /api/safety`): per-driver 0–100 score from seeded harsh-braking / speeding / idle event rates per 100 miles — fleet average 83.2, best A. Kumar 96.5 (Excellent), worst L. Brown 56.1 (At risk, needs braking coaching)
 
 ## Queue (next, in order — one per day, do not skip or repeat)
-1. Driver safety score — harsh braking / speeding / idle proxy, per driver
-2. Fuel, toll & cost per trip — estimated cost per shipment + fleet totals
-3. Cold-chain temperature alerts — reefer temperature log + threshold alerts
-4. Maintenance prediction — service due by vehicle miles / age proxy
-5. White-label customer tracking — branded tracking link per tenant
-6. Invoicing & quotes — quote from miles + rate, invoice per delivered trip
-7. Anomaly / theft alerts — route deviation + long idle detection
-8. Multi-modal — ocean/air leg in the same shipment model
-9. Carbon tracking — CO2 per trip from miles + vehicle type
+1. Fuel, toll & cost per trip — estimated cost per shipment + fleet totals
+2. Cold-chain temperature alerts — reefer temperature log + threshold alerts
+3. Maintenance prediction — service due by vehicle miles / age proxy
+4. White-label customer tracking — branded tracking link per tenant
+5. Invoicing & quotes — quote from miles + rate, invoice per delivered trip
+6. Anomaly / theft alerts — route deviation + long idle detection
+7. Multi-modal — ocean/air leg in the same shipment model
+8. Carbon tracking — CO2 per trip from miles + vehicle type
 
 ## Daily run checklist (for the cron agent)
 1. Read this file, pick the next unchecked queue item.
