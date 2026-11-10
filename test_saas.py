@@ -1,7 +1,7 @@
 """Tests for the SaaS ETA model. Run: python3 test_saas.py"""
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
-from app import predict_eta, optimise_route, record_pod, get_pod, fleet_analytics, list_notifications, init_db, shipment_detail, chat_reply, map_data, dispatcher_briefing, send_notification, list_dock_slots, book_dock_slot, dwell_stats, forecast_demand, demand_history
+from app import predict_eta, optimise_route, record_pod, get_pod, fleet_analytics, list_notifications, init_db, shipment_detail, chat_reply, map_data, dispatcher_briefing, send_notification, list_dock_slots, book_dock_slot, dwell_stats, forecast_demand, demand_history, driver_safety_scores, safety_events
 
 def base(**kw):
     d = {"id": "TRK-TEST", "remaining_miles": 100, "speed_mph": 55,
@@ -108,7 +108,27 @@ def test_demand_forecasting():
     assert "80" in r["reply"] or "trucks" in r["reply"].lower()
     print("demand forecasting OK", f["total_trucks_next_week"], "trucks;", chi)
 
+def test_driver_safety_scores():
+    init_db()
+    assert len(safety_events()) == 8  # one seeded row per demo driver
+    s = driver_safety_scores()
+    assert len(s["drivers"]) == 8 and s["period_days"] == 30
+    assert 80 < s["fleet_average_score"] < 85
+    best = s["drivers"][0]
+    assert best["driver"] == "A. Kumar" and best["safety_score"] == 96.5 and best["band"] == "Excellent"
+    worst = s["drivers"][-1]
+    assert worst["driver"] == "L. Brown" and worst["safety_score"] == 56.1 and worst["band"] == "At risk"
+    assert worst["top_risk_factor"] == "harsh_braking" and "braking" in worst["recommendation"].lower()
+    fair = next(d for d in s["drivers"] if d["driver"] == "T. Nguyen")
+    assert fair["band"] == "Fair" and fair["safety_score"] == 71.7
+    one = driver_safety_scores("S. Patel")
+    assert len(one["drivers"]) == 1 and one["drivers"][0]["band"] == "Good"
+    assert driver_safety_scores("Nobody Here")["drivers"] == []
+    r = chat_reply("What is the driver safety score?")
+    assert "A. Kumar" in r["reply"] and "L. Brown" in r["reply"]
+    print("driver safety OK", s["fleet_average_score"], "avg;", best["driver"], best["safety_score"], ";", worst["driver"], worst["safety_score"])
+
 if __name__ == "__main__":
     test_window_and_confidence(); test_traffic_slows_eta(); test_stale_gps_lowers_confidence(); test_delay_flag()
-    test_route_optimisation(); test_pod_and_detail(); test_notifications_and_fleet(); test_chatbot(); test_map_briefing_notify(); test_dock_scheduling(); test_demand_forecasting()
-    print("All 11 tests passed.")
+    test_route_optimisation(); test_pod_and_detail(); test_notifications_and_fleet(); test_chatbot(); test_map_briefing_notify(); test_dock_scheduling(); test_demand_forecasting(); test_driver_safety_scores()
+    print("All 12 tests passed.")
