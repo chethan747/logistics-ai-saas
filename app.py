@@ -171,6 +171,7 @@ def init_v2_tables(con=None):
     c.execute("DELETE FROM stops"); c.execute("DELETE FROM notifications"); c.execute("DELETE FROM dock_slots")
     seed_demand_history(con)
     seed_safety_events(con)
+    seed_temp_readings(con)
     dock = []
     for facility, door in [("Columbus DC", "A1"), ("Chicago DC", "B1"), ("Detroit DC", "C1"), ("Cincinnati DC", "D1")]:
         for i, t in enumerate(["08:00", "10:00", "12:00", "14:00", "16:00"]):
@@ -610,6 +611,132 @@ def fleet_costs(shipment_id=None):
             "method": "fuel = miles/MPG x $3.85/gal; toll = seeded flat per lane; driver = ETA hours x $28/hr — seeded demo rates, not real fuel-card/toll/payroll data",
             "note": "Demo cost estimates from seeded rates and straight-line trip miles only. Use real fuel-card, toll and payroll data before quoting customers or paying drivers."}
 
+# ---------- COLD-CHAIN TEMPERATURE ALERTS (seeded reefer sensor log) ----------
+# Honest scope: temperatures are SEEDED demo sensor readings (12 readings
+# per reefer shipment, 15 min apart, invented for the demo). They are NOT
+# from a real reefer telematics / IoT sensor feed — a production version
+# would ingest live reefer probe data, calibrate thresholds per cargo,
+# and page the dispatcher on a real excursion. Thresholds below are
+# demo assumptions for chilled (2-4 C) and frozen (-20 to -16 C) cargo.
+COLD_CHAIN_SHIPMENTS = {
+    # shipment_id: (cargo, temp_min_c, temp_max_c)
+    "TRK-101": ("Chilled produce", 2.0, 4.0),
+    "TRK-103": ("Frozen food", -20.0, -16.0),
+    "TRK-105": ("Dairy (chilled)", 2.0, 4.0),
+    "TRK-107": ("Frozen pharmaceuticals", -20.0, -16.0),
+}
+COLD_CHAIN_BASE_TIME = "2026-11-12T09:00:00Z"
+COLD_CHAIN_READINGS = {
+    "TRK-101": [2.1, 2.4, 2.8, 3.1, 3.5, 3.2, 2.9, 3.0, 3.4, 3.1, 2.7, 3.0],
+    "TRK-103": [-18.5, -18.2, -17.8, -17.5, -16.9, -15.2, -14.8, -14.1, -13.9, -14.5, -15.8, -16.4],
+    "TRK-105": [2.5, 3.0, 3.6, 4.1, 4.3, 3.9, 3.4, 3.2, 2.9, 3.3, 3.8, 3.5],
+    "TRK-107": [-19.1, -18.8, -18.4, -19.0, -18.6, -18.9, -19.2, -18.5, -18.7, -19.0, -18.8, -18.6],
+}
+
+def seed_temp_readings(con):
+    c = con.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS temp_readings
+        (shipment_id TEXT, reading_time TEXT, temp_c REAL)""")
+    c.execute("DELETE FROM temp_readings")
+    base = datetime.fromisoformat(COLD_CHAIN_BASE_TIME.replace("Z", "+00:00"))
+    for sid, temps in COLD_CHAIN_READINGS.items():
+        for i, t in enumerate(temps):
+            ts = (base + timedelta(minutes=15 * i)).isoformat().replace("+00:00", "Z")
+            c.execute("INSERT INTO temp_readings VALUES (?,?,?)", (sid, ts, t))
+
+def temp_readings(shipment_id=None):
+    con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
+    q = "SELECT * FROM temp_readings ORDER BY shipment_id, reading_time"
+    args = ()
+    if shipment_id:
+        q = "SELECT * FROM temp_readings WHERE shipment_id=? ORDER BY reading_time"
+        args = (shipment_id,)
+    rows = [dict(r) for r in con.execute(q, args)]
+    con.close()
+    return rows
+
+def _cold_chain_for(sid, readings, ship):
+    cargo, tmin, tmax = COLD_CHAIN_SHIPMENTS[sid]
+    temps = [r["temp_c"] for r in readings]
+    out_flags = [t < tmin or t > tmax for t in temps]
+    out_count = sum(out_flags)
+    longest, run = 0, 0
+    for f in out_flags:
+        run = run + 1 if f else 0
+        longest = max(longest, run)
+    max_dev = round(max([0.0] + [max(t - tmax, tmin - t, 0) for t in temps]), 1)
+    current = temps[-1] if temps else None
+    in_range_pct = round(100 * (len(temps) - out_count) / len(temps), 1) if temps else 0
+    current_dev = round(max(current - tmax, tmin - current, 0), 1) if current is not None else 0
+    if longest >= 3 or current_dev > 2.0:
+        status = "critical"
+        rec = (f"Sustained excursion: {longest} consecutive readings out of band, up to "
+               f"{max_dev}°C outside the {tmin}–{tmax}°C band. Check the reefer unit now and "
+               f"alert the customer — cargo may be at risk.")
+    elif out_count > 0:
+        status = "warning"
+        rec = ("Brief excursion outside the band — check the reefer unit at the next stop "
+               "and watch the next readings.")
+    else:
+        status = "ok"
+        rec = "Temperature in band — no action needed."
+    return {
+        "shipment_id": sid, "cargo": cargo,
+        "origin": ship["origin"] if ship else None,
+        "destination": ship["destination"] if ship else None,
+        "driver": ship["driver"] if ship else None,
+        "vehicle": ship["vehicle"] if ship else None,
+        "shipment_status": ship["status"] if ship else None,
+        "temp_min_c": tmin, "temp_max_c": tmax,
+        "readings": len(temps),
+        "latest_reading_time": readings[-1]["reading_time"] if readings else None,
+        "current_temp_c": current,
+        "min_temp_c": round(min(temps), 1) if temps else None,
+        "max_temp_c": round(max(temps), 1) if temps else None,
+        "in_range_pct": in_range_pct,
+        "out_of_range_count": out_count,
+        "longest_excursion_readings": longest,
+        "max_deviation_c": max_dev,
+        "status": status,
+        "recommendation": rec,
+    }
+
+def cold_chain_status(shipment_id=None):
+    """Per-reefer-shipment temperature status from the seeded sensor log.
+    Status: critical if 3+ consecutive readings out of band or the current
+    reading is >2°C out of band; warning if any reading is out of band;
+    ok otherwise. Seeded demo readings only — see COLD_CHAIN_READINGS."""
+    ships = all_shipments()
+    by_id = {s["id"]: s for s in ships}
+    ids = [shipment_id] if shipment_id else sorted(COLD_CHAIN_SHIPMENTS)
+    out = []
+    for sid in ids:
+        if sid not in COLD_CHAIN_SHIPMENTS:
+            continue
+        out.append(_cold_chain_for(sid, temp_readings(sid), by_id.get(sid)))
+    counts = {"ok": 0, "warning": 0, "critical": 0}
+    for s in out:
+        counts[s["status"]] += 1
+    return {"reefer_shipments": len(out), "ok": counts["ok"], "warning": counts["warning"],
+            "critical": counts["critical"],
+            "alerts": [s for s in out if s["status"] != "ok"],
+            "shipments": out,
+            "method": "critical if 3+ consecutive readings out of band or current reading >2°C out of band; warning if any reading out of band; else ok — on seeded demo sensor readings",
+            "note": "Demo temperature log from seeded readings only (12 readings per reefer shipment, 15 min apart). Connect a real reefer sensor feed before using alerts for cargo decisions."}
+
+def record_temp_reading(shipment_id, temp_c):
+    """Log a new (demo) temperature reading for a reefer shipment and
+    return its updated cold-chain status. Returns ok=False for a
+    non-reefer or unknown shipment."""
+    if shipment_id not in COLD_CHAIN_SHIPMENTS:
+        return {"ok": False, "error": f"{shipment_id} is not a refrigerated (reefer) shipment in this demo"}
+    con = sqlite3.connect(DB)
+    con.execute("INSERT INTO temp_readings VALUES (?,?,?)",
+                (shipment_id, datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), float(temp_c)))
+    con.commit(); con.close()
+    st = cold_chain_status(shipment_id)
+    return {"ok": True, "shipment": st["shipments"][0] if st["shipments"] else None}
+
 def fleet_analytics():
     ships = all_shipments()
     by_driver, by_vehicle = {}, {}
@@ -634,7 +761,8 @@ def shipment_detail(shipment_id):
     stops = get_stops(shipment_id)
     return {**s, "stops": stops, "route": optimise_route(stops) if stops else None,
             "pod": get_pod(shipment_id), "notifications": list_notifications(shipment_id),
-            "dock_booking": get_dock_booking(shipment_id)}
+            "dock_booking": get_dock_booking(shipment_id),
+            "cold_chain": cold_chain_status(shipment_id)["shipments"][0] if shipment_id in COLD_CHAIN_SHIPMENTS else None}
 
 # ---------- LIVE CHATBOT (dashboard AI assistant, rule-based demo) ----------
 # Honest scope: this assistant answers from live shipment/ETA data in this
@@ -694,6 +822,14 @@ def chat_reply(message):
         s = driver_safety_scores()
         best, worst = s["drivers"][0], s["drivers"][-1]
         return {"reply": f"Driver safety (last {s['period_days']} days, seeded demo data): fleet average {s['fleet_average_score']}. Best: {best['driver']} at {best['safety_score']} ({best['band']}). Needs coaching: {worst['driver']} at {worst['safety_score']} ({worst['band']}) — {worst['recommendation']} Open /safety for the full table.", "suggestions": ["Which trucks are delayed?", "What is my on-time rate?"]}
+    if any(k in low for k in ("cold chain", "cold-chain", "temperature", "temp", "reefer", "frozen", "chilled", "fridge")):
+        cc = cold_chain_status()
+        crit = [s for s in cc["shipments"] if s["status"] == "critical"]
+        warn = [s for s in cc["shipments"] if s["status"] == "warning"]
+        if not crit and not warn:
+            return {"reply": f"Cold chain looks fine: all {cc['reefer_shipments']} reefer shipments are in their temperature band (demo sensor log). Open /coldchain for the full log.", "suggestions": ["Which trucks are delayed?", "What is TRK-101 ETA?"]}
+        lines = "; ".join(f"{s['shipment_id']} ({s['cargo']}, {s['current_temp_c']}°C vs {s['temp_min_c']}–{s['temp_max_c']}°C, {s['status']})" for s in crit + warn)
+        return {"reply": f"Cold-chain alerts (demo sensor log): {len(crit)} critical, {len(warn)} warning of {cc['reefer_shipments']} reefer shipments. {lines}. Open /coldchain for the full temperature log and recommendations.", "suggestions": ["Which trucks are delayed?", "What is TRK-101 ETA?"]}
     if "fleet" in low or "driver" in low:
         f = fleet_analytics()
         drivers = ", ".join(f"{k}: {v['shipments']} shipments, {v['delivered']} delivered" for k, v in f["by_driver"].items())
@@ -728,7 +864,7 @@ def page(title, body):
     .card{{border:1px solid #ddd;border-radius:12px;padding:16px;margin:12px 0}}
     a{{color:#0b5fff}} .pill{{padding:2px 8px;border-radius:999px;background:#eef2ff}}
     </style></head><body><h1>{title}</h1>{body}
-    <p><a href='/'>Home</a> · <a href='/dashboard'>Dashboard</a> · <a href='/portal'>Customer Portal</a> · <a href='/analytics'>Analytics</a> · <a href='/fleet'>Fleet</a> · <a href='/forecast'>Demand Forecast</a> · <a href='/safety'>Driver Safety</a> · <a href='/cost'>Trip Cost</a> · <a href='/notifications'>Notifications</a> · <a href='/pricing'>Pricing</a> · <a href='/api/shipments'>API JSON</a></p>
+    <p><a href='/'>Home</a> · <a href='/dashboard'>Dashboard</a> · <a href='/portal'>Customer Portal</a> · <a href='/analytics'>Analytics</a> · <a href='/fleet'>Fleet</a> · <a href='/forecast'>Demand Forecast</a> · <a href='/safety'>Driver Safety</a> · <a href='/cost'>Trip Cost</a> · <a href='/coldchain'>Cold Chain</a> · <a href='/notifications'>Notifications</a> · <a href='/pricing'>Pricing</a> · <a href='/api/shipments'>API JSON</a></p>
     <p><small>Demo SaaS — simulated data, demo logins only. Not production, no real payments or GPS.</small></p></body></html>"""
 
 class H(BaseHTTPRequestHandler):
@@ -744,7 +880,7 @@ class H(BaseHTTPRequestHandler):
             <p><a href='/dashboard'>Open dispatcher dashboard →</a></p></div>
             <div class='card'><h3>SaaS modules</h3><ul>
             <li>Shipments & live tracking</li><li>AI ETA + delay risk</li><li>Alerts & customer portal</li>
-            <li>Proof of delivery · Route optimisation (nearest-first + 2-opt) · Fleet analytics · Notifications log · Customer portal · Dock scheduling · <a href='/forecast'>Demand forecasting</a> · <a href='/safety'>Driver safety score</a> · <a href='/cost'>Fuel, toll & cost per trip</a></li></ul></div>"""))
+            <li>Proof of delivery · Route optimisation (nearest-first + 2-opt) · Fleet analytics · Notifications log · Customer portal · Dock scheduling · <a href='/forecast'>Demand forecasting</a> · <a href='/safety'>Driver safety score</a> · <a href='/cost'>Fuel, toll & cost per trip</a> · <a href='/coldchain'>Cold-chain temperature alerts</a></li></ul></div>"""))
         elif u.path == "/dashboard":
             a = analytics()
             filt = q.get("status", ["all"])[0]; search = q.get("q", [""])[0].lower()
@@ -828,6 +964,10 @@ class H(BaseHTTPRequestHandler):
             t = c["fleet_totals_usd"]
             rows = "".join(f"<tr><td>{x['shipment_id']}</td><td>{x['origin']} → {x['destination']}</td><td>{x['driver']} / {x['vehicle']}</td><td>{x['trip_miles_estimate']}</td><td>{x['fuel_gallons']} gal (${x['fuel_cost_usd']})</td><td>${x['toll_cost_usd']}</td><td>{x['driver_hours']} h (${x['driver_cost_usd']})</td><td><b>${x['total_cost_usd']}</b></td><td>${x['cost_per_mile_usd']}</td></tr>" for x in c["shipments"])
             self._send(200, page("Fuel, Toll & Cost per Trip", f"<div class='card'><p>Fleet totals (demo estimates): <b>${t['total_cost_usd']}</b> across {len(c['shipments'])} shipments · {c['fleet_trip_miles_estimate']} trip miles · <b>${c['fleet_cost_per_mile_usd']}/mile</b></p><p>Fuel ${t['fuel_cost_usd']} · Tolls ${t['toll_cost_usd']} · Driver time ${t['driver_cost_usd']} · Most expensive: {c['most_expensive_shipment']}</p><p>Method: {c['method']}.</p><p><small>{c['note']}</small></p></div><table><tr><th>ID</th><th>Route</th><th>Driver / Vehicle</th><th>Trip miles (est.)</th><th>Fuel</th><th>Toll</th><th>Driver time</th><th>Total</th><th>$/mile</th></tr>{rows}</table>"))
+        elif u.path == "/coldchain":
+            cc = cold_chain_status()
+            rows = "".join(f"<tr><td>{s['shipment_id']}</td><td>{s['cargo']}</td><td>{s['origin']} → {s['destination']}</td><td>{s['temp_min_c']}–{s['temp_max_c']} °C</td><td>{s['current_temp_c']} °C</td><td>{s['min_temp_c']}–{s['max_temp_c']} °C</td><td>{s['in_range_pct']}%</td><td>{s['out_of_range_count']}</td><td>{s['longest_excursion_readings']}</td><td><b>{s['status']}</b></td><td>{s['recommendation']}</td></tr>" for s in cc["shipments"])
+            self._send(200, page("Cold-Chain Temperature Alerts", f"<div class='card'><p>Reefer shipments: <b>{cc['reefer_shipments']}</b> · In range: {cc['ok']} · Warning: {cc['warning']} · Critical: <b>{cc['critical']}</b></p><p>Method: {cc['method']}.</p><p><small>{cc['note']}</small></p><p>Log a reading (demo): <input id='csid' placeholder='TRK-101'> <input id='ctemp' placeholder='3.5'> <button onclick=\"fetch('/api/coldchain/reading',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{shipment_id:document.getElementById('csid').value,temp_c:parseFloat(document.getElementById('ctemp').value)}})}}).then(r=>r.json()).then(x=>alert(JSON.stringify(x))).then(()=>location.reload())\">Log reading</button></p></div><table><tr><th>ID</th><th>Cargo</th><th>Route</th><th>Band °C</th><th>Current °C</th><th>Min–Max °C</th><th>In range</th><th>Out of range</th><th>Longest excursion</th><th>Status</th><th>Recommendation</th></tr>{rows}</table>"))
         elif u.path == "/chat":
             self._send(200, page("Live AI Chatbot", CHAT_WIDGET + "<p>Ask about any shipment, delay, ETA, POD, route, or fleet issue. The bot answers from live demo data.</p>"))
         elif u.path == "/mobile":
@@ -871,6 +1011,9 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/api/cost":
             sid = q.get("id", [None])[0]
             self._send(200, json.dumps(fleet_costs(sid), indent=2), "application/json")
+        elif u.path == "/api/coldchain":
+            sid = q.get("id", [None])[0]
+            self._send(200, json.dumps(cold_chain_status(sid), indent=2), "application/json")
         else:
             self._send(404, page("Not found", "<p>Try /dashboard</p>"))
     def do_POST(self):
@@ -880,6 +1023,13 @@ class H(BaseHTTPRequestHandler):
         elif self.path == "/api/notify":
             n = int(self.headers.get("Content-Length", 0)); data = json.loads(self.rfile.read(n) or b"{}")
             r = send_notification(data.get("id", "TRK-101"), data.get("channel", "sms"), data.get("message", "Update on your delivery."))
+            self._send(200, json.dumps(r, indent=2), "application/json")
+        elif self.path == "/api/coldchain/reading":
+            n = int(self.headers.get("Content-Length", 0)); data = json.loads(self.rfile.read(n) or b"{}")
+            try:
+                r = record_temp_reading(data.get("shipment_id", ""), float(data.get("temp_c")))
+            except (TypeError, ValueError):
+                r = {"ok": False, "error": "temp_c must be a number"}
             self._send(200, json.dumps(r, indent=2), "application/json")
         elif self.path == "/api/chat":
             n = int(self.headers.get("Content-Length", 0)); data = json.loads(self.rfile.read(n) or b"{}")
