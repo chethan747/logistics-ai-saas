@@ -33,11 +33,13 @@ python3 test_saas.py
 - `/dock` + `POST /api/dock/book` — dock scheduling & dwell time: 20 slots (Columbus/Chicago/Detroit/Cincinnati, 2026-11-09), booking cuts dwell to 15 min and improves ETA
 - `/forecast` + `GET /api/forecast` (+ `?lane=...`) — demand forecasting: weekly truck need by lane from 8 weeks of seeded demo history — 4-week moving average + trend, confidence from week-to-week variability; 80 trucks total for the week of 2026-11-09 across 8 lanes. Seeded history only, not real bookings — re-fit on real order history before capacity decisions
 - `/safety` + `GET /api/safety` (+ `?driver=...`) — driver safety score: per-driver 0–100 score from seeded harsh-braking / speeding / idle event rates per 100 miles (last 30 days) — weights 15/10/5, bands Excellent ≥90 / Good ≥75 / Fair ≥60 / At risk <60, with top risk factor and coaching recommendation per driver; fleet average 83.2, best A. Kumar 96.5, worst L. Brown 56.1 (At risk). Seeded demo event counts only, not real telematics — connect a real telematics feed before using scores for coaching or insurance decisions
+- `/cost` + `GET /api/cost` (+ `?id=...`) — fuel, toll & cost per trip: estimated cost per shipment = fuel (haversine trip miles / vehicle MPG × $3.85/gal diesel) + seeded flat toll per lane + driver time (AI ETA hours, or actual minutes if delivered, × $28/hr); fleet total $1,716.70 across 8 shipments, $1.19/mile, most expensive TRK-106 $341.95. Seeded demo rates and straight-line miles only — use real fuel-card, toll and payroll data before quoting customers or paying drivers
 
 ## Pages
 - `/dashboard` — summary cards, search, filter by AI status, shipment table
 - `/forecast` — demand forecast: weekly truck need by lane, history, trend, confidence, recommendations
 - `/safety` — driver safety score: per-driver score, band, event rates, coaching recommendation
+- `/cost` — fuel, toll & cost per trip: per-shipment cost breakdown, fleet totals, $/mile
 - `/shipment?id=TRK-101` — detail view
 - `/portal` — customer portal (routes, status, ETA windows only)
 - `/fleet`, `/notifications`, `/analytics`, `/pricing`
@@ -63,6 +65,8 @@ admin@demo.local, dispatcher@demo.local, driver@demo.local, customer@demo.local
    proof of delivery records, notifications log, shipment detail view
 8. Driver safety score (per-driver 0–100 from seeded harsh-braking /
    speeding / idle rates per 100 miles, bands + coaching recommendations)
+9. Fuel, toll & cost per trip (per-shipment estimate = fuel + toll +
+   driver time from seeded demo rates; fleet totals + $/mile)
 
 ## Next steps to make it production
 1. Replace simulated seed with a pilot fleet GPS feed.
