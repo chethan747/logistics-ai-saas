@@ -1,7 +1,7 @@
 """Tests for the SaaS ETA model. Run: python3 test_saas.py"""
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
-from app import predict_eta, optimise_route, record_pod, get_pod, fleet_analytics, list_notifications, init_db, shipment_detail, chat_reply, map_data, dispatcher_briefing, send_notification, list_dock_slots, book_dock_slot, dwell_stats, forecast_demand, demand_history, driver_safety_scores, safety_events, trip_cost, fleet_costs, trip_miles
+from app import predict_eta, optimise_route, record_pod, get_pod, fleet_analytics, list_notifications, init_db, shipment_detail, chat_reply, map_data, dispatcher_briefing, send_notification, list_dock_slots, book_dock_slot, dwell_stats, forecast_demand, demand_history, driver_safety_scores, safety_events, trip_cost, fleet_costs, trip_miles, temp_readings, cold_chain_status, record_temp_reading
 
 def base(**kw):
     d = {"id": "TRK-TEST", "remaining_miles": 100, "speed_mph": 55,
@@ -158,7 +158,39 @@ def test_trip_costs():
     assert "1716.7" in r["reply"] or "fleet total" in r["reply"].lower()
     print("trip costs OK", c["fleet_totals_usd"], "; TRK-101 $", t101["total_cost_usd"])
 
+def test_cold_chain_alerts():
+    init_db()
+    assert len(temp_readings()) == 48  # 4 reefer shipments x 12 seeded readings
+    cc = cold_chain_status()
+    assert cc["reefer_shipments"] == 4 and len(cc["shipments"]) == 4
+    assert cc["ok"] == 2 and cc["warning"] == 1 and cc["critical"] == 1
+    t103 = next(s for s in cc["shipments"] if s["shipment_id"] == "TRK-103")
+    assert t103["status"] == "critical" and t103["longest_excursion_readings"] == 6
+    assert t103["max_deviation_c"] == 2.1 and t103["current_temp_c"] == -16.4
+    assert t103["out_of_range_count"] == 6 and t103["in_range_pct"] == 50.0
+    assert t103["cargo"] == "Frozen food" and t103["temp_min_c"] == -20.0 and t103["temp_max_c"] == -16.0
+    t105 = next(s for s in cc["shipments"] if s["shipment_id"] == "TRK-105")
+    assert t105["status"] == "warning" and t105["out_of_range_count"] == 2
+    assert t105["longest_excursion_readings"] == 2 and t105["max_deviation_c"] == 0.3
+    t101 = next(s for s in cc["shipments"] if s["shipment_id"] == "TRK-101")
+    assert t101["status"] == "ok" and t101["out_of_range_count"] == 0
+    assert t101["in_range_pct"] == 100.0 and t101["current_temp_c"] == 3.0
+    # single-shipment view + non-reefer shipment has no cold-chain data
+    one = cold_chain_status("TRK-101")
+    assert len(one["shipments"]) == 1 and one["shipments"][0]["cargo"] == "Chilled produce"
+    assert cold_chain_status("TRK-102")["shipments"] == []
+    # logging a reading updates the status (demo POST path)
+    r = record_temp_reading("TRK-101", 4.6)
+    assert r["ok"] is True and r["shipment"]["status"] == "warning"
+    assert r["shipment"]["out_of_range_count"] == 1 and r["shipment"]["current_temp_c"] == 4.6
+    assert record_temp_reading("TRK-102", 3.0)["ok"] is False  # not a reefer shipment
+    # chatbot answers cold-chain questions from the seeded log
+    init_db()  # reset so the chatbot sees the seeded state again
+    c = chat_reply("Any cold chain temperature alerts?")
+    assert "TRK-103" in c["reply"] and "critical" in c["reply"].lower()
+    print("cold-chain alerts OK", cc["ok"], "ok /", cc["warning"], "warning /", cc["critical"], "critical;", "TRK-103 max dev", t103["max_deviation_c"], "°C")
+
 if __name__ == "__main__":
     test_window_and_confidence(); test_traffic_slows_eta(); test_stale_gps_lowers_confidence(); test_delay_flag()
-    test_route_optimisation(); test_pod_and_detail(); test_notifications_and_fleet(); test_chatbot(); test_map_briefing_notify(); test_dock_scheduling(); test_demand_forecasting(); test_driver_safety_scores(); test_trip_costs()
-    print("All 13 tests passed.")
+    test_route_optimisation(); test_pod_and_detail(); test_notifications_and_fleet(); test_chatbot(); test_map_briefing_notify(); test_dock_scheduling(); test_demand_forecasting(); test_driver_safety_scores(); test_trip_costs(); test_cold_chain_alerts()
+    print("All 14 tests passed.")
