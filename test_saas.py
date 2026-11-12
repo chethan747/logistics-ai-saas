@@ -1,7 +1,7 @@
 """Tests for the SaaS ETA model. Run: python3 test_saas.py"""
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
-from app import predict_eta, optimise_route, record_pod, get_pod, fleet_analytics, list_notifications, init_db, shipment_detail, chat_reply, map_data, dispatcher_briefing, send_notification, list_dock_slots, book_dock_slot, dwell_stats, forecast_demand, demand_history, driver_safety_scores, safety_events
+from app import predict_eta, optimise_route, record_pod, get_pod, fleet_analytics, list_notifications, init_db, shipment_detail, chat_reply, map_data, dispatcher_briefing, send_notification, list_dock_slots, book_dock_slot, dwell_stats, forecast_demand, demand_history, driver_safety_scores, safety_events, trip_cost, fleet_costs, trip_miles
 
 def base(**kw):
     d = {"id": "TRK-TEST", "remaining_miles": 100, "speed_mph": 55,
@@ -128,7 +128,37 @@ def test_driver_safety_scores():
     assert "A. Kumar" in r["reply"] and "L. Brown" in r["reply"]
     print("driver safety OK", s["fleet_average_score"], "avg;", best["driver"], best["safety_score"], ";", worst["driver"], worst["safety_score"])
 
+def test_trip_costs():
+    init_db()
+    m = trip_miles({"origin": "Columbus, OH", "destination": "Chicago, IL", "remaining_miles": 180})
+    assert m == 276.2  # haversine straight-line estimate, not road miles
+    c = fleet_costs()
+    assert len(c["shipments"]) == 8
+    t101 = next(x for x in c["shipments"] if x["shipment_id"] == "TRK-101")
+    assert t101["mpg"] == 6.8 and t101["fuel_gallons"] == 40.62
+    assert t101["fuel_cost_usd"] == 156.39 and t101["toll_cost_usd"] == 28.5
+    assert t101["driver_cost_usd"] == 108.08 and t101["total_cost_usd"] == 292.97
+    assert t101["cost_per_mile_usd"] == 1.06
+    # components add up to the total for every shipment
+    for x in c["shipments"]:
+        assert abs(x["fuel_cost_usd"] + x["toll_cost_usd"] + x["driver_cost_usd"] - x["total_cost_usd"]) < 0.02
+        assert x["total_cost_usd"] > 0 and x["cost_per_mile_usd"] > 0
+    # fleet totals are the sum of per-shipment costs
+    assert c["fleet_totals_usd"] == {"fuel_cost_usd": 831.8, "toll_cost_usd": 121.9,
+                                     "driver_cost_usd": 763.0, "total_cost_usd": 1716.7}
+    assert c["fleet_trip_miles_estimate"] == 1436.8 and c["fleet_cost_per_mile_usd"] == 1.19
+    assert c["most_expensive_shipment"] == "TRK-106"
+    # delivered shipment uses actual minutes for driver time, not ETA
+    t106 = next(x for x in c["shipments"] if x["shipment_id"] == "TRK-106")
+    assert t106["driver_hours"] == 5.92 and t106["total_cost_usd"] == 341.95
+    one = fleet_costs("TRK-102")
+    assert len(one["shipments"]) == 1 and one["shipments"][0]["total_cost_usd"] == 119.94
+    assert fleet_costs("TRK-999")["shipments"] == []
+    r = chat_reply("What is the fuel and toll cost per trip?")
+    assert "1716.7" in r["reply"] or "fleet total" in r["reply"].lower()
+    print("trip costs OK", c["fleet_totals_usd"], "; TRK-101 $", t101["total_cost_usd"])
+
 if __name__ == "__main__":
     test_window_and_confidence(); test_traffic_slows_eta(); test_stale_gps_lowers_confidence(); test_delay_flag()
-    test_route_optimisation(); test_pod_and_detail(); test_notifications_and_fleet(); test_chatbot(); test_map_briefing_notify(); test_dock_scheduling(); test_demand_forecasting(); test_driver_safety_scores()
-    print("All 12 tests passed.")
+    test_route_optimisation(); test_pod_and_detail(); test_notifications_and_fleet(); test_chatbot(); test_map_briefing_notify(); test_dock_scheduling(); test_demand_forecasting(); test_driver_safety_scores(); test_trip_costs()
+    print("All 13 tests passed.")
