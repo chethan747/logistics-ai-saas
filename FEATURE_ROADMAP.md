@@ -14,10 +14,10 @@ GitHub Contents API (no git CLI push).
 - 2026-11-08 — Dock scheduling + dwell time (`/dock`, `POST /api/dock/book`): booking a slot cuts dwell to 15 min and improves ETA
 - 2026-11-09 — Demand forecasting (`/forecast`, `GET /api/forecast`): weekly truck need by lane from 8 weeks of seeded history — 4-week moving average + trend, 80 trucks total for week of 2026-11-09 across 8 lanes
 - 2026-11-10 — Driver safety score (`/safety`, `GET /api/safety`): per-driver 0–100 score from seeded harsh-braking / speeding / idle event rates per 100 miles — fleet average 83.2, best A. Kumar 96.5 (Excellent), worst L. Brown 56.1 (At risk, needs braking coaching)
+- 2026-11-12 — Fuel, toll & cost per trip (`/cost`, `GET /api/cost`): estimated cost per shipment = fuel (trip miles / MPG × $3.85/gal diesel) + seeded flat toll per lane + driver time (AI ETA hours × $28/hr); fleet total $1,716.70 across 8 shipments, $1.19/mile, most expensive TRK-106 $341.95 (delivered, actual minutes for driver time)
 
 ## Queue (next, in order — one per day, do not skip or repeat)
-1. Fuel, toll & cost per trip — estimated cost per shipment + fleet totals
-2. Cold-chain temperature alerts — reefer temperature log + threshold alerts
+1. Cold-chain temperature alerts — reefer temperature log + threshold alerts
 3. Maintenance prediction — service due by vehicle miles / age proxy
 4. White-label customer tracking — branded tracking link per tenant
 5. Invoicing & quotes — quote from miles + rate, invoice per delivered trip
