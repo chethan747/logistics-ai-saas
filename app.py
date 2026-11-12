@@ -526,6 +526,90 @@ def driver_safety_scores(driver=None):
             "method": "100 - 15*harsh + 10*speeding + 5*idle events per 100 miles, on seeded demo event counts — not real telematics",
             "note": "Demo safety scores from seeded event counts only. Connect a real telematics feed before using scores for coaching or insurance decisions."}
 
+# ---------- FUEL, TOLL & COST PER TRIP (seeded demo rates) ----------
+# Honest scope: costs are estimates from SEEDED demo assumptions, NOT
+# real fuel-card, toll-transponder or payroll data. Diesel price, MPG
+# per vehicle, flat toll per lane and the driver hourly rate are demo
+# inputs dated 2026-11-12. Trip miles are a haversine straight-line
+# estimate between origin and destination cities, not road miles.
+# A production version would ingest real fuel-card transactions,
+# toll bills and driver pay, and use routed road miles.
+DIESEL_PRICE_PER_GAL = 3.85   # USD/gal, seeded demo rate, 2026-11-12
+DRIVER_HOURLY_RATE = 28.00    # USD/hour, seeded demo rate
+VEHICLE_MPG = {  # seeded demo fuel economy per vehicle
+    "Truck-02": 6.5, "Truck-03": 7.0, "Truck-04": 6.2, "Truck-05": 7.2,
+    "Truck-07": 6.8, "Truck-08": 6.5, "Truck-09": 7.0, "Truck-11": 6.0,
+}
+DEFAULT_MPG = 6.5
+LANE_TOLLS = {  # seeded flat toll per lane (USD), demo assumption
+    "Columbus, OH → Chicago, IL": 28.50,
+    "Columbus, OH → Cleveland, OH": 6.25,
+    "Chicago, IL → Detroit, MI": 18.75,
+    "Columbus, OH → Cincinnati, OH": 4.50,
+    "Indianapolis, IN → Columbus, OH": 9.80,
+    "Chicago, IL → Columbus, OH": 28.50,
+    "Detroit, MI → Cleveland, OH": 11.40,
+    "Columbus, OH → Pittsburgh, PA": 14.20,
+}
+TOLL_FALLBACK_PER_MILE = 0.12  # USD/mile when a lane has no seeded toll
+
+def trip_miles(shipment):
+    """Full-trip distance estimate: haversine miles origin → destination.
+    Straight-line estimate, not road miles — see module note above."""
+    a = CITY_COORDS.get(shipment["origin"]); b = CITY_COORDS.get(shipment["destination"])
+    if not a or not b:
+        return round(float(shipment["remaining_miles"] or 0), 1)
+    return round(haversine_miles(a, b), 1)
+
+def trip_cost(shipment):
+    """Estimated cost for one shipment: fuel + toll + driver time.
+    Driver hours come from the AI ETA (predicted minutes) for active
+    shipments, or actual minutes for delivered ones."""
+    miles = trip_miles(shipment)
+    mpg = VEHICLE_MPG.get(shipment["vehicle"], DEFAULT_MPG)
+    gallons = round(miles / mpg, 2) if miles else 0
+    fuel_cost = round(gallons * DIESEL_PRICE_PER_GAL, 2)
+    lane = f"{shipment['origin']} → {shipment['destination']}"
+    toll_cost = round(LANE_TOLLS.get(lane, miles * TOLL_FALLBACK_PER_MILE), 2)
+    eta = predict_eta(shipment) if shipment["remaining_miles"] > 0 else None
+    minutes = eta["predicted_minutes"] if eta else float(shipment.get("actual_minutes") or 0)
+    driver_hours = round(minutes / 60, 2)
+    driver_cost = round(driver_hours * DRIVER_HOURLY_RATE, 2)
+    total = round(fuel_cost + toll_cost + driver_cost, 2)
+    return {
+        "shipment_id": shipment["id"],
+        "origin": shipment["origin"], "destination": shipment["destination"],
+        "driver": shipment["driver"], "vehicle": shipment["vehicle"],
+        "status": shipment["status"],
+        "trip_miles_estimate": miles,
+        "mpg": mpg, "diesel_price_per_gal": DIESEL_PRICE_PER_GAL,
+        "fuel_gallons": gallons, "fuel_cost_usd": fuel_cost,
+        "toll_cost_usd": toll_cost,
+        "driver_hours": driver_hours, "driver_rate_per_hour": DRIVER_HOURLY_RATE,
+        "driver_cost_usd": driver_cost,
+        "total_cost_usd": total,
+        "cost_per_mile_usd": round(total / miles, 2) if miles else 0,
+    }
+
+def fleet_costs(shipment_id=None):
+    """Per-shipment cost estimates plus fleet totals. Pass an id for a
+    single shipment; otherwise all shipments in the demo fleet."""
+    ships = all_shipments()
+    if shipment_id:
+        ships = [s for s in ships if s["id"] == shipment_id]
+    costs = [trip_cost(s) for s in ships]
+    totals = {k: round(sum(c[k] for c in costs), 2) for k in
+              ("fuel_cost_usd", "toll_cost_usd", "driver_cost_usd", "total_cost_usd")}
+    miles = round(sum(c["trip_miles_estimate"] for c in costs), 1)
+    most = max(costs, key=lambda c: c["total_cost_usd"]) if costs else None
+    return {"shipments": costs,
+            "fleet_totals_usd": totals,
+            "fleet_trip_miles_estimate": miles,
+            "fleet_cost_per_mile_usd": round(totals["total_cost_usd"] / miles, 2) if miles else 0,
+            "most_expensive_shipment": most["shipment_id"] if most else None,
+            "method": "fuel = miles/MPG x $3.85/gal; toll = seeded flat per lane; driver = ETA hours x $28/hr — seeded demo rates, not real fuel-card/toll/payroll data",
+            "note": "Demo cost estimates from seeded rates and straight-line trip miles only. Use real fuel-card, toll and payroll data before quoting customers or paying drivers."}
+
 def fleet_analytics():
     ships = all_shipments()
     by_driver, by_vehicle = {}, {}
@@ -595,6 +679,11 @@ def chat_reply(message):
         return {"reply": "To record proof of delivery: open a shipment detail page, fill method (signature / photo / OTP), signed-by name and OTP, then submit. It is stored and the shipment becomes delivered. Try TRK-106 — it already has a seeded POD.", "suggestions": ["What is TRK-106 status?", "Show all shipments"]}
     if "route" in low or "optim" in low:
         return {"reply": "Route optimisation in this demo is a nearest-first stub, not a full TSP solver: open /shipment?id=TRK-101 to see its optimised stop order. A production version would add time windows, vehicle capacity, and driver hours.", "suggestions": ["What is TRK-101 ETA?", "Which trucks are delayed?"]}
+    if "fuel" in low or "toll" in low or "trip cost" in low or "cost per trip" in low or "cost of" in low or "how much does" in low and "cost" in low:
+        c = fleet_costs()
+        t = c["fleet_totals_usd"]
+        ex = "; ".join(f"{x['shipment_id']}: ${x['total_cost_usd']} (${x['cost_per_mile_usd']}/mi)" for x in sorted(c["shipments"], key=lambda x: -x["total_cost_usd"])[:3])
+        return {"reply": f"Trip cost (demo estimates from seeded rates: diesel ${DIESEL_PRICE_PER_GAL}/gal, driver ${DRIVER_HOURLY_RATE}/hr, seeded tolls per lane): fleet total ${t['total_cost_usd']} across {len(c['shipments'])} shipments — fuel ${t['fuel_cost_usd']}, tolls ${t['toll_cost_usd']}, driver time ${t['driver_cost_usd']}, {c['fleet_cost_per_mile_usd']}/mile. Most expensive: {ex}. These are estimates, not real fuel-card or toll data — open /cost for the full breakdown.", "suggestions": ["Which trucks are delayed?", "What is TRK-101 ETA?", "What is my on-time rate?"]}
     if "price" in low or "pricing" in low or "cost" in low:
         return {"reply": "Pricing is intentionally not locked in this demo — test it after a pilot. The pricing page shows Starter (up to 10 vehicles), Growth (up to 50), and Scale (unlimited) tiers.", "suggestions": ["How do I use the dashboard?", "Talk to support"]}
     if "support" in low or "human" in low or "contact" in low or "help" in low or low in ("hi", "hello", "hey"):
@@ -639,7 +728,7 @@ def page(title, body):
     .card{{border:1px solid #ddd;border-radius:12px;padding:16px;margin:12px 0}}
     a{{color:#0b5fff}} .pill{{padding:2px 8px;border-radius:999px;background:#eef2ff}}
     </style></head><body><h1>{title}</h1>{body}
-    <p><a href='/'>Home</a> · <a href='/dashboard'>Dashboard</a> · <a href='/portal'>Customer Portal</a> · <a href='/analytics'>Analytics</a> · <a href='/fleet'>Fleet</a> · <a href='/forecast'>Demand Forecast</a> · <a href='/safety'>Driver Safety</a> · <a href='/notifications'>Notifications</a> · <a href='/pricing'>Pricing</a> · <a href='/api/shipments'>API JSON</a></p>
+    <p><a href='/'>Home</a> · <a href='/dashboard'>Dashboard</a> · <a href='/portal'>Customer Portal</a> · <a href='/analytics'>Analytics</a> · <a href='/fleet'>Fleet</a> · <a href='/forecast'>Demand Forecast</a> · <a href='/safety'>Driver Safety</a> · <a href='/cost'>Trip Cost</a> · <a href='/notifications'>Notifications</a> · <a href='/pricing'>Pricing</a> · <a href='/api/shipments'>API JSON</a></p>
     <p><small>Demo SaaS — simulated data, demo logins only. Not production, no real payments or GPS.</small></p></body></html>"""
 
 class H(BaseHTTPRequestHandler):
@@ -655,7 +744,7 @@ class H(BaseHTTPRequestHandler):
             <p><a href='/dashboard'>Open dispatcher dashboard →</a></p></div>
             <div class='card'><h3>SaaS modules</h3><ul>
             <li>Shipments & live tracking</li><li>AI ETA + delay risk</li><li>Alerts & customer portal</li>
-            <li>Proof of delivery · Route optimisation (nearest-first + 2-opt) · Fleet analytics · Notifications log · Customer portal · Dock scheduling · <a href='/forecast'>Demand forecasting</a> · <a href='/safety'>Driver safety score</a></li></ul></div>"""))
+            <li>Proof of delivery · Route optimisation (nearest-first + 2-opt) · Fleet analytics · Notifications log · Customer portal · Dock scheduling · <a href='/forecast'>Demand forecasting</a> · <a href='/safety'>Driver safety score</a> · <a href='/cost'>Fuel, toll & cost per trip</a></li></ul></div>"""))
         elif u.path == "/dashboard":
             a = analytics()
             filt = q.get("status", ["all"])[0]; search = q.get("q", [""])[0].lower()
@@ -734,6 +823,11 @@ class H(BaseHTTPRequestHandler):
             at_risk = [d for d in s["drivers"] if d["band"] == "At risk"]
             warn = f"<p><b>Needs coaching:</b> {', '.join(d['driver'] for d in at_risk)}.</p>" if at_risk else "<p>No driver is currently At risk.</p>"
             self._send(200, page("Driver Safety Score", f"<div class='card'><p>Last {s['period_days']} days (seeded demo event counts) · Fleet average score: <b>{s['fleet_average_score']}</b></p><p>Method: {s['method']}.</p><p><small>{s['note']}</small></p>{warn}</div><table><tr><th>#</th><th>Driver</th><th>Miles</th><th>Harsh braking</th><th>Speeding</th><th>Long idle</th><th>Score</th><th>Band</th><th>Top risk</th><th>Recommendation</th></tr>{rows}</table>"))
+        elif u.path == "/cost":
+            c = fleet_costs()
+            t = c["fleet_totals_usd"]
+            rows = "".join(f"<tr><td>{x['shipment_id']}</td><td>{x['origin']} → {x['destination']}</td><td>{x['driver']} / {x['vehicle']}</td><td>{x['trip_miles_estimate']}</td><td>{x['fuel_gallons']} gal (${x['fuel_cost_usd']})</td><td>${x['toll_cost_usd']}</td><td>{x['driver_hours']} h (${x['driver_cost_usd']})</td><td><b>${x['total_cost_usd']}</b></td><td>${x['cost_per_mile_usd']}</td></tr>" for x in c["shipments"])
+            self._send(200, page("Fuel, Toll & Cost per Trip", f"<div class='card'><p>Fleet totals (demo estimates): <b>${t['total_cost_usd']}</b> across {len(c['shipments'])} shipments · {c['fleet_trip_miles_estimate']} trip miles · <b>${c['fleet_cost_per_mile_usd']}/mile</b></p><p>Fuel ${t['fuel_cost_usd']} · Tolls ${t['toll_cost_usd']} · Driver time ${t['driver_cost_usd']} · Most expensive: {c['most_expensive_shipment']}</p><p>Method: {c['method']}.</p><p><small>{c['note']}</small></p></div><table><tr><th>ID</th><th>Route</th><th>Driver / Vehicle</th><th>Trip miles (est.)</th><th>Fuel</th><th>Toll</th><th>Driver time</th><th>Total</th><th>$/mile</th></tr>{rows}</table>"))
         elif u.path == "/chat":
             self._send(200, page("Live AI Chatbot", CHAT_WIDGET + "<p>Ask about any shipment, delay, ETA, POD, route, or fleet issue. The bot answers from live demo data.</p>"))
         elif u.path == "/mobile":
@@ -774,6 +868,9 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/api/safety":
             drv = q.get("driver", [None])[0]
             self._send(200, json.dumps(driver_safety_scores(drv), indent=2), "application/json")
+        elif u.path == "/api/cost":
+            sid = q.get("id", [None])[0]
+            self._send(200, json.dumps(fleet_costs(sid), indent=2), "application/json")
         else:
             self._send(404, page("Not found", "<p>Try /dashboard</p>"))
     def do_POST(self):
