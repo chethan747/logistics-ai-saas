@@ -35,6 +35,7 @@ python3 test_saas.py
 - `/safety` + `GET /api/safety` (+ `?driver=...`) — driver safety score: per-driver 0–100 score from seeded harsh-braking / speeding / idle event rates per 100 miles (last 30 days) — weights 15/10/5, bands Excellent ≥90 / Good ≥75 / Fair ≥60 / At risk <60, with top risk factor and coaching recommendation per driver; fleet average 83.2, best A. Kumar 96.5, worst L. Brown 56.1 (At risk). Seeded demo event counts only, not real telematics — connect a real telematics feed before using scores for coaching or insurance decisions
 - `/cost` + `GET /api/cost` (+ `?id=...`) — fuel, toll & cost per trip: estimated cost per shipment = fuel (haversine trip miles / vehicle MPG × $3.85/gal diesel) + seeded flat toll per lane + driver time (AI ETA hours, or actual minutes if delivered, × $28/hr); fleet total $1,716.70 across 8 shipments, $1.19/mile, most expensive TRK-106 $341.95. Seeded demo rates and straight-line miles only — use real fuel-card, toll and payroll data before quoting customers or paying drivers
 - `/coldchain` + `GET /api/coldchain` (+ `?id=...`) + `POST /api/coldchain/reading` — cold-chain temperature alerts: reefer temperature log (12 seeded readings per reefer shipment, 15 min apart) with threshold alerts — critical if 3+ consecutive readings out of band or current reading >2°C out of band, warning if any reading out of band; 4 reefer shipments (TRK-101, TRK-103, TRK-105, TRK-107), TRK-103 critical (6 consecutive readings out of band, max 2.1°C over the −20 to −16°C frozen band), TRK-105 warning (2 readings over 4°C). Seeded demo sensor readings only — connect a real reefer sensor feed before using alerts for cargo decisions
+- `/maintenance` + `GET /api/maintenance` (+ `?vehicle=...`) + `POST /api/maintenance/service` — maintenance prediction: service due every 10,000 miles or 180 days, whichever first, from seeded odometer readings — 8 vehicles, 3 ok / 4 due soon / 1 overdue; Truck-11 overdue (950 miles / 9 days past, due 2026-11-04), Truck-04 and Truck-05 due in 2 days (2026-11-15), Truck-02 next major 30,000-mile service (due 2026-12-23). Logging a completed service resets the clock. Seeded demo odometer readings only — connect a real telematics / maintenance system before using predictions for service scheduling
 
 ## Pages
 - `/dashboard` — summary cards, search, filter by AI status, shipment table
@@ -42,6 +43,7 @@ python3 test_saas.py
 - `/safety` — driver safety score: per-driver score, band, event rates, coaching recommendation
 - `/cost` — fuel, toll & cost per trip: per-shipment cost breakdown, fleet totals, $/mile
 - `/coldchain` — cold-chain temperature alerts: reefer temperature log, threshold status, excursion history, recommendations
+- `/maintenance` — maintenance prediction: service due by miles / age proxy, per-vehicle predicted service date, status, recommendations
 - `/shipment?id=TRK-101` — detail view
 - `/portal` — customer portal (routes, status, ETA windows only)
 - `/fleet`, `/notifications`, `/analytics`, `/pricing`
@@ -72,6 +74,9 @@ admin@demo.local, dispatcher@demo.local, driver@demo.local, customer@demo.local
 10. Cold-chain temperature alerts (reefer temperature log + threshold
     alerts from seeded readings; critical/warning/ok bands + per-shipment
     recommendations; log-a-reading API)
+11. Maintenance prediction (service due every 10,000 miles or 180 days
+    from seeded odometer readings; predicted service date + status per
+    vehicle; 30,000-mile major service; log-a-service API)
 
 ## Next steps to make it production
 1. Replace simulated seed with a pilot fleet GPS feed.
