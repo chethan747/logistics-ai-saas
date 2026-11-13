@@ -172,6 +172,7 @@ def init_v2_tables(con=None):
     seed_demand_history(con)
     seed_safety_events(con)
     seed_temp_readings(con)
+    seed_maintenance(con)
     dock = []
     for facility, door in [("Columbus DC", "A1"), ("Chicago DC", "B1"), ("Detroit DC", "C1"), ("Cincinnati DC", "D1")]:
         for i, t in enumerate(["08:00", "10:00", "12:00", "14:00", "16:00"]):
@@ -737,6 +738,144 @@ def record_temp_reading(shipment_id, temp_c):
     st = cold_chain_status(shipment_id)
     return {"ok": True, "shipment": st["shipments"][0] if st["shipments"] else None}
 
+# ---------- MAINTENANCE PREDICTION (seeded odometer / age proxy) ----------
+# Honest scope: predictions are computed from SEEDED demo odometer
+# readings, last-service dates and average daily miles (invented for
+# the demo, as of 2026-11-13). They are NOT from a real telematics /
+# maintenance system — a production version would ingest live odometer
+# readings, real service history and fault codes, and calibrate the
+# interval on real breakdown data. Service is due every 10,000 miles
+# or 180 days, whichever comes first; a 30,000-mile major service
+# replaces the standard one when its milestone falls inside the
+# service window.
+MAINTENANCE_AS_OF = "2026-11-13"
+SERVICE_INTERVAL_MILES = 10000
+SERVICE_INTERVAL_DAYS = 180
+MAJOR_SERVICE_EVERY_MILES = 30000
+MAINTENANCE_DUE_SOON_DAYS = 14
+MAINTENANCE_SEED = {
+    # vehicle: (odometer_miles, last_service_odometer_miles,
+    #           last_service_date, avg_miles_per_day, model_year)
+    "Truck-02": (148200, 142000, "2026-09-20", 95, 2021),
+    "Truck-03": (96450, 89000, "2026-09-05", 85, 2022),
+    "Truck-04": (121850, 112000, "2026-08-28", 60, 2020),
+    "Truck-05": (88300, 78500, "2026-10-10", 90, 2023),
+    "Truck-07": (132700, 124000, "2026-10-01", 110, 2021),
+    "Truck-08": (74600, 66000, "2026-09-15", 100, 2022),
+    "Truck-09": (155400, 148000, "2026-08-15", 95, 2019),
+    "Truck-11": (168950, 158000, "2026-08-01", 105, 2020),
+}
+
+def seed_maintenance(con):
+    c = con.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS maintenance
+        (vehicle TEXT PRIMARY KEY, odometer_miles REAL,
+         last_service_odometer_miles REAL, last_service_date TEXT,
+         avg_miles_per_day REAL, model_year INTEGER)""")
+    c.execute("DELETE FROM maintenance")
+    for vehicle, (odo, last_odo, last_date, mpd, year) in MAINTENANCE_SEED.items():
+        c.execute("INSERT INTO maintenance VALUES (?,?,?,?,?,?)",
+                  (vehicle, odo, last_odo, last_date, mpd, year))
+
+def maintenance_records(vehicle=None):
+    con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
+    q = "SELECT * FROM maintenance ORDER BY vehicle"
+    args = ()
+    if vehicle:
+        q = "SELECT * FROM maintenance WHERE vehicle=? ORDER BY vehicle"
+        args = (vehicle,)
+    rows = [dict(r) for r in con.execute(q, args)]
+    con.close()
+    return rows
+
+def _maintenance_for(r, assignment):
+    as_of = datetime.fromisoformat(MAINTENANCE_AS_OF)
+    odo = float(r["odometer_miles"])
+    last_odo = float(r["last_service_odometer_miles"])
+    last_date = datetime.fromisoformat(r["last_service_date"])
+    miles_since = round(odo - last_odo, 1)
+    miles_remaining = round(SERVICE_INTERVAL_MILES - miles_since, 1)
+    days_since = (as_of - last_date).days
+    days_remaining = SERVICE_INTERVAL_DAYS - days_since
+    mpd = float(r["avg_miles_per_day"]) or 1
+    days_until_due = round(min(miles_remaining / mpd, days_remaining))
+    predicted_date = (as_of + timedelta(days=days_until_due)).date().isoformat()
+    next_major = math.ceil(odo / MAJOR_SERVICE_EVERY_MILES) * MAJOR_SERVICE_EVERY_MILES
+    major_due = (next_major - odo) <= miles_remaining
+    service_type = ("Major service (30,000-mile)" if major_due
+                    else "Standard service (oil + filter + inspection)")
+    if miles_remaining <= 0 or days_until_due < 0:
+        status = "overdue"
+        rec = (f"Service overdue by {-days_until_due} day(s) / {-miles_remaining:,.0f} miles — "
+               "pull from rotation and book service immediately.")
+    elif days_until_due <= MAINTENANCE_DUE_SOON_DAYS:
+        status = "due_soon"
+        rec = (f"Book {service_type.lower()} within {days_until_due} day(s) "
+               f"({miles_remaining:,.0f} miles left) — plan around the next dispatch.")
+    else:
+        status = "ok"
+        rec = (f"No service needed for about {days_until_due} days "
+               f"({miles_remaining:,.0f} miles left) — monitor odometer.")
+    return {
+        "vehicle": r["vehicle"],
+        "model_year": r["model_year"],
+        "vehicle_age_years": as_of.year - int(r["model_year"]),
+        "driver": assignment.get("driver") if assignment else None,
+        "current_shipment_id": assignment.get("id") if assignment else None,
+        "current_shipment_status": assignment.get("status") if assignment else None,
+        "odometer_miles": odo,
+        "last_service_odometer_miles": last_odo,
+        "last_service_date": r["last_service_date"],
+        "avg_miles_per_day": mpd,
+        "miles_since_service": miles_since,
+        "miles_until_service": miles_remaining,
+        "days_since_service": days_since,
+        "days_until_service": days_until_due,
+        "days_overdue": -days_until_due if days_until_due < 0 else 0,
+        "predicted_service_date": predicted_date,
+        "service_type": service_type,
+        "status": status,
+        "recommendation": rec,
+    }
+
+def maintenance_status(vehicle=None):
+    """Per-vehicle service prediction from the seeded odometer log.
+    Service due every 10,000 miles or 180 days, whichever first;
+    predicted date assumes the seeded average daily miles continue.
+    Seeded demo data only — see MAINTENANCE_SEED."""
+    ships = all_shipments()
+    by_vehicle = {}
+    for s in ships:
+        by_vehicle.setdefault(s["vehicle"], s)
+    out = [_maintenance_for(r, by_vehicle.get(r["vehicle"]))
+           for r in maintenance_records(vehicle)]
+    out.sort(key=lambda v: v["days_until_service"])
+    counts = {"ok": 0, "due_soon": 0, "overdue": 0}
+    for v in out:
+        counts[v["status"]] += 1
+    next_due = out[0] if out else None
+    return {"as_of_date": MAINTENANCE_AS_OF,
+            "vehicles": len(out), "ok": counts["ok"],
+            "due_soon": counts["due_soon"], "overdue": counts["overdue"],
+            "next_service_due_vehicle": next_due["vehicle"] if next_due else None,
+            "next_service_due_date": next_due["predicted_service_date"] if next_due else None,
+            "maintenance": out,
+            "method": "service every 10,000 miles or 180 days, whichever first; predicted date from seeded average daily miles — on seeded demo odometer readings",
+            "note": "Demo maintenance predictions from seeded odometer readings only. Connect a real telematics / maintenance system before using predictions for service scheduling."}
+
+def record_service(vehicle, odometer_miles):
+    """Log a completed (demo) service for a vehicle: resets the
+    service clock to the as-of date at the given odometer reading.
+    Returns ok=False for an unknown vehicle."""
+    if vehicle not in MAINTENANCE_SEED:
+        return {"ok": False, "error": f"{vehicle} is not a vehicle in this demo fleet"}
+    con = sqlite3.connect(DB)
+    con.execute("UPDATE maintenance SET odometer_miles=?, last_service_odometer_miles=?, last_service_date=? WHERE vehicle=?",
+                (float(odometer_miles), float(odometer_miles), MAINTENANCE_AS_OF, vehicle))
+    con.commit(); con.close()
+    st = maintenance_status(vehicle)
+    return {"ok": True, "vehicle": st["maintenance"][0] if st["maintenance"] else None}
+
 def fleet_analytics():
     ships = all_shipments()
     by_driver, by_vehicle = {}, {}
@@ -762,6 +901,7 @@ def shipment_detail(shipment_id):
     return {**s, "stops": stops, "route": optimise_route(stops) if stops else None,
             "pod": get_pod(shipment_id), "notifications": list_notifications(shipment_id),
             "dock_booking": get_dock_booking(shipment_id),
+            "maintenance": (maintenance_status(s["vehicle"])["maintenance"] or [None])[0] if s["vehicle"] in MAINTENANCE_SEED else None,
             "cold_chain": cold_chain_status(shipment_id)["shipments"][0] if shipment_id in COLD_CHAIN_SHIPMENTS else None}
 
 # ---------- LIVE CHATBOT (dashboard AI assistant, rule-based demo) ----------
@@ -830,6 +970,14 @@ def chat_reply(message):
             return {"reply": f"Cold chain looks fine: all {cc['reefer_shipments']} reefer shipments are in their temperature band (demo sensor log). Open /coldchain for the full log.", "suggestions": ["Which trucks are delayed?", "What is TRK-101 ETA?"]}
         lines = "; ".join(f"{s['shipment_id']} ({s['cargo']}, {s['current_temp_c']}°C vs {s['temp_min_c']}–{s['temp_max_c']}°C, {s['status']})" for s in crit + warn)
         return {"reply": f"Cold-chain alerts (demo sensor log): {len(crit)} critical, {len(warn)} warning of {cc['reefer_shipments']} reefer shipments. {lines}. Open /coldchain for the full temperature log and recommendations.", "suggestions": ["Which trucks are delayed?", "What is TRK-101 ETA?"]}
+    if any(k in low for k in ("maintenance", "service due", "due for service", "service overdue", "service schedule", "oil change", "inspection", "mechanic")):
+        m = maintenance_status()
+        od = [v for v in m["maintenance"] if v["status"] == "overdue"]
+        soon = [v for v in m["maintenance"] if v["status"] == "due_soon"]
+        if not od and not soon:
+            return {"reply": f"Maintenance looks fine: all {m['vehicles']} vehicles are within their service window (demo odometer log, as of {m['as_of_date']}). Open /maintenance for the full schedule.", "suggestions": ["Which trucks are delayed?", "What is TRK-101 ETA?"]}
+        lines = "; ".join(f"{v['vehicle']} ({v['driver'] or 'unassigned'}, {v['status'].replace('_', ' ')}, {v['days_until_service']} days, due {v['predicted_service_date']})" for v in od + soon)
+        return {"reply": f"Maintenance (demo odometer log, as of {m['as_of_date']}): {m['overdue']} overdue, {m['due_soon']} due soon of {m['vehicles']} vehicles. {lines}. Open /maintenance for the full schedule and recommendations.", "suggestions": ["Which trucks are delayed?", "What is TRK-101 ETA?"]}
     if "fleet" in low or "driver" in low:
         f = fleet_analytics()
         drivers = ", ".join(f"{k}: {v['shipments']} shipments, {v['delivered']} delivered" for k, v in f["by_driver"].items())
@@ -864,7 +1012,7 @@ def page(title, body):
     .card{{border:1px solid #ddd;border-radius:12px;padding:16px;margin:12px 0}}
     a{{color:#0b5fff}} .pill{{padding:2px 8px;border-radius:999px;background:#eef2ff}}
     </style></head><body><h1>{title}</h1>{body}
-    <p><a href='/'>Home</a> · <a href='/dashboard'>Dashboard</a> · <a href='/portal'>Customer Portal</a> · <a href='/analytics'>Analytics</a> · <a href='/fleet'>Fleet</a> · <a href='/forecast'>Demand Forecast</a> · <a href='/safety'>Driver Safety</a> · <a href='/cost'>Trip Cost</a> · <a href='/coldchain'>Cold Chain</a> · <a href='/notifications'>Notifications</a> · <a href='/pricing'>Pricing</a> · <a href='/api/shipments'>API JSON</a></p>
+    <p><a href='/'>Home</a> · <a href='/dashboard'>Dashboard</a> · <a href='/portal'>Customer Portal</a> · <a href='/analytics'>Analytics</a> · <a href='/fleet'>Fleet</a> · <a href='/forecast'>Demand Forecast</a> · <a href='/safety'>Driver Safety</a> · <a href='/cost'>Trip Cost</a> · <a href='/coldchain'>Cold Chain</a> · <a href='/maintenance'>Maintenance</a> · <a href='/notifications'>Notifications</a> · <a href='/pricing'>Pricing</a> · <a href='/api/shipments'>API JSON</a></p>
     <p><small>Demo SaaS — simulated data, demo logins only. Not production, no real payments or GPS.</small></p></body></html>"""
 
 class H(BaseHTTPRequestHandler):
@@ -880,7 +1028,7 @@ class H(BaseHTTPRequestHandler):
             <p><a href='/dashboard'>Open dispatcher dashboard →</a></p></div>
             <div class='card'><h3>SaaS modules</h3><ul>
             <li>Shipments & live tracking</li><li>AI ETA + delay risk</li><li>Alerts & customer portal</li>
-            <li>Proof of delivery · Route optimisation (nearest-first + 2-opt) · Fleet analytics · Notifications log · Customer portal · Dock scheduling · <a href='/forecast'>Demand forecasting</a> · <a href='/safety'>Driver safety score</a> · <a href='/cost'>Fuel, toll & cost per trip</a> · <a href='/coldchain'>Cold-chain temperature alerts</a></li></ul></div>"""))
+            <li>Proof of delivery · Route optimisation (nearest-first + 2-opt) · Fleet analytics · Notifications log · Customer portal · Dock scheduling · <a href='/forecast'>Demand forecasting</a> · <a href='/safety'>Driver safety score</a> · <a href='/cost'>Fuel, toll & cost per trip</a> · <a href='/coldchain'>Cold-chain temperature alerts</a> · <a href='/maintenance'>Maintenance prediction</a></li></ul></div>"""))
         elif u.path == "/dashboard":
             a = analytics()
             filt = q.get("status", ["all"])[0]; search = q.get("q", [""])[0].lower()
@@ -968,6 +1116,10 @@ class H(BaseHTTPRequestHandler):
             cc = cold_chain_status()
             rows = "".join(f"<tr><td>{s['shipment_id']}</td><td>{s['cargo']}</td><td>{s['origin']} → {s['destination']}</td><td>{s['temp_min_c']}–{s['temp_max_c']} °C</td><td>{s['current_temp_c']} °C</td><td>{s['min_temp_c']}–{s['max_temp_c']} °C</td><td>{s['in_range_pct']}%</td><td>{s['out_of_range_count']}</td><td>{s['longest_excursion_readings']}</td><td><b>{s['status']}</b></td><td>{s['recommendation']}</td></tr>" for s in cc["shipments"])
             self._send(200, page("Cold-Chain Temperature Alerts", f"<div class='card'><p>Reefer shipments: <b>{cc['reefer_shipments']}</b> · In range: {cc['ok']} · Warning: {cc['warning']} · Critical: <b>{cc['critical']}</b></p><p>Method: {cc['method']}.</p><p><small>{cc['note']}</small></p><p>Log a reading (demo): <input id='csid' placeholder='TRK-101'> <input id='ctemp' placeholder='3.5'> <button onclick=\"fetch('/api/coldchain/reading',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{shipment_id:document.getElementById('csid').value,temp_c:parseFloat(document.getElementById('ctemp').value)}})}}).then(r=>r.json()).then(x=>alert(JSON.stringify(x))).then(()=>location.reload())\">Log reading</button></p></div><table><tr><th>ID</th><th>Cargo</th><th>Route</th><th>Band °C</th><th>Current °C</th><th>Min–Max °C</th><th>In range</th><th>Out of range</th><th>Longest excursion</th><th>Status</th><th>Recommendation</th></tr>{rows}</table>"))
+        elif u.path == "/maintenance":
+            m = maintenance_status()
+            rows = "".join(f"<tr><td>{v['vehicle']}</td><td>{v['driver'] or '—'} ({v['current_shipment_id'] or '—'})</td><td>{v['odometer_miles']:,.0f}</td><td>{v['last_service_date']} @ {v['last_service_odometer_miles']:,.0f} mi</td><td>{v['miles_since_service']:,.0f}</td><td>{v['miles_until_service']:,.0f}</td><td>{v['avg_miles_per_day']}</td><td>{v['predicted_service_date']}</td><td>{v['days_until_service']}</td><td>{v['service_type']}</td><td><b>{v['status']}</b></td><td>{v['recommendation']}</td></tr>" for v in m["maintenance"])
+            self._send(200, page("Maintenance Prediction — Service Due by Miles / Age", f"<div class='card'><p>As of <b>{m['as_of_date']}</b> · Vehicles: <b>{m['vehicles']}</b> · OK: {m['ok']} · Due soon: {m['due_soon']} · Overdue: <b>{m['overdue']}</b> · Next service due: {m['next_service_due_vehicle']} ({m['next_service_due_date']})</p><p>Method: {m['method']}.</p><p><small>{m['note']}</small></p><p>Log a completed service (demo): <input id='mveh' placeholder='Truck-11'> <input id='modo' placeholder='169000'> <button onclick=\"fetch('/api/maintenance/service',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{vehicle:document.getElementById('mveh').value,odometer_miles:parseFloat(document.getElementById('modo').value)}})}}).then(r=>r.json()).then(x=>alert(JSON.stringify(x))).then(()=>location.reload())\">Log service</button></p></div><table><tr><th>Vehicle</th><th>Driver (shipment)</th><th>Odometer (mi)</th><th>Last service</th><th>Miles since</th><th>Miles left</th><th>Avg mi/day</th><th>Predicted service date</th><th>Days until due</th><th>Service type</th><th>Status</th><th>Recommendation</th></tr>{rows}</table>"))
         elif u.path == "/chat":
             self._send(200, page("Live AI Chatbot", CHAT_WIDGET + "<p>Ask about any shipment, delay, ETA, POD, route, or fleet issue. The bot answers from live demo data.</p>"))
         elif u.path == "/mobile":
@@ -1014,6 +1166,9 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/api/coldchain":
             sid = q.get("id", [None])[0]
             self._send(200, json.dumps(cold_chain_status(sid), indent=2), "application/json")
+        elif u.path == "/api/maintenance":
+            veh = q.get("vehicle", [None])[0]
+            self._send(200, json.dumps(maintenance_status(veh), indent=2), "application/json")
         else:
             self._send(404, page("Not found", "<p>Try /dashboard</p>"))
     def do_POST(self):
@@ -1030,6 +1185,13 @@ class H(BaseHTTPRequestHandler):
                 r = record_temp_reading(data.get("shipment_id", ""), float(data.get("temp_c")))
             except (TypeError, ValueError):
                 r = {"ok": False, "error": "temp_c must be a number"}
+            self._send(200, json.dumps(r, indent=2), "application/json")
+        elif self.path == "/api/maintenance/service":
+            n = int(self.headers.get("Content-Length", 0)); data = json.loads(self.rfile.read(n) or b"{}")
+            try:
+                r = record_service(data.get("vehicle", ""), float(data.get("odometer_miles")))
+            except (TypeError, ValueError):
+                r = {"ok": False, "error": "odometer_miles must be a number"}
             self._send(200, json.dumps(r, indent=2), "application/json")
         elif self.path == "/api/chat":
             n = int(self.headers.get("Content-Length", 0)); data = json.loads(self.rfile.read(n) or b"{}")
