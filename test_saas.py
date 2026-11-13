@@ -1,7 +1,7 @@
 """Tests for the SaaS ETA model. Run: python3 test_saas.py"""
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
-from app import predict_eta, optimise_route, record_pod, get_pod, fleet_analytics, list_notifications, init_db, shipment_detail, chat_reply, map_data, dispatcher_briefing, send_notification, list_dock_slots, book_dock_slot, dwell_stats, forecast_demand, demand_history, driver_safety_scores, safety_events, trip_cost, fleet_costs, trip_miles, temp_readings, cold_chain_status, record_temp_reading
+from app import predict_eta, optimise_route, record_pod, get_pod, fleet_analytics, list_notifications, init_db, shipment_detail, chat_reply, map_data, dispatcher_briefing, send_notification, list_dock_slots, book_dock_slot, dwell_stats, forecast_demand, demand_history, driver_safety_scores, safety_events, trip_cost, fleet_costs, trip_miles, temp_readings, cold_chain_status, record_temp_reading, maintenance_records, maintenance_status, record_service
 
 def base(**kw):
     d = {"id": "TRK-TEST", "remaining_miles": 100, "speed_mph": 55,
@@ -190,7 +190,48 @@ def test_cold_chain_alerts():
     assert "TRK-103" in c["reply"] and "critical" in c["reply"].lower()
     print("cold-chain alerts OK", cc["ok"], "ok /", cc["warning"], "warning /", cc["critical"], "critical;", "TRK-103 max dev", t103["max_deviation_c"], "°C")
 
+def test_maintenance_prediction():
+    init_db()
+    assert len(maintenance_records()) == 8  # one seeded row per demo vehicle
+    m = maintenance_status()
+    assert m["as_of_date"] == "2026-11-13" and m["vehicles"] == 8
+    assert m["ok"] == 3 and m["due_soon"] == 4 and m["overdue"] == 1
+    assert m["next_service_due_vehicle"] == "Truck-11" and m["next_service_due_date"] == "2026-11-04"
+    t11 = next(v for v in m["maintenance"] if v["vehicle"] == "Truck-11")
+    assert t11["status"] == "overdue" and t11["days_until_service"] == -9 and t11["days_overdue"] == 9
+    assert t11["miles_until_service"] == -950.0 and t11["predicted_service_date"] == "2026-11-04"
+    assert t11["driver"] == "S. Patel" and t11["current_shipment_id"] == "TRK-103"
+    assert "pull from rotation" in t11["recommendation"].lower()
+    t04 = next(v for v in m["maintenance"] if v["vehicle"] == "Truck-04")
+    assert t04["status"] == "due_soon" and t04["days_until_service"] == 2 and t04["predicted_service_date"] == "2026-11-15"
+    assert t04["miles_until_service"] == 150.0
+    t07 = next(v for v in m["maintenance"] if v["vehicle"] == "Truck-07")
+    assert t07["status"] == "due_soon" and t07["days_until_service"] == 12 and t07["predicted_service_date"] == "2026-11-25"
+    t02 = next(v for v in m["maintenance"] if v["vehicle"] == "Truck-02")
+    assert t02["status"] == "ok" and t02["days_until_service"] == 40 and t02["predicted_service_date"] == "2026-12-23"
+    assert t02["service_type"] == "Major service (30,000-mile)" and t02["vehicle_age_years"] == 5
+    # most urgent first, least urgent last
+    assert m["maintenance"][0]["vehicle"] == "Truck-11" and m["maintenance"][-1]["vehicle"] == "Truck-02"
+    # single-vehicle view + unknown vehicle
+    one = maintenance_status("Truck-05")
+    assert len(one["maintenance"]) == 1 and one["maintenance"][0]["status"] == "due_soon"
+    assert maintenance_status("Truck-99")["maintenance"] == []
+    # shipment detail carries its vehicle's maintenance prediction
+    d = shipment_detail("TRK-103")
+    assert d["maintenance"] and d["maintenance"]["vehicle"] == "Truck-11" and d["maintenance"]["status"] == "overdue"
+    # logging a completed service resets the clock (demo POST path)
+    r = record_service("Truck-11", 169000)
+    assert r["ok"] is True and r["vehicle"]["status"] == "ok"
+    assert r["vehicle"]["miles_until_service"] == 10000.0 and r["vehicle"]["days_until_service"] == 95
+    assert r["vehicle"]["last_service_date"] == "2026-11-13" and r["vehicle"]["predicted_service_date"] == "2027-02-16"
+    assert record_service("Truck-99", 1000)["ok"] is False  # unknown vehicle
+    # chatbot answers maintenance questions from the seeded log
+    init_db()  # reset so the chatbot sees the seeded state again
+    c = chat_reply("Which trucks need maintenance?")
+    assert "Truck-11" in c["reply"] and "overdue" in c["reply"].lower()
+    print("maintenance prediction OK", m["ok"], "ok /", m["due_soon"], "due soon /", m["overdue"], "overdue;", "Truck-11", t11["days_until_service"], "days")
+
 if __name__ == "__main__":
     test_window_and_confidence(); test_traffic_slows_eta(); test_stale_gps_lowers_confidence(); test_delay_flag()
-    test_route_optimisation(); test_pod_and_detail(); test_notifications_and_fleet(); test_chatbot(); test_map_briefing_notify(); test_dock_scheduling(); test_demand_forecasting(); test_driver_safety_scores(); test_trip_costs(); test_cold_chain_alerts()
-    print("All 14 tests passed.")
+    test_route_optimisation(); test_pod_and_detail(); test_notifications_and_fleet(); test_chatbot(); test_map_briefing_notify(); test_dock_scheduling(); test_demand_forecasting(); test_driver_safety_scores(); test_trip_costs(); test_cold_chain_alerts(); test_maintenance_prediction()
+    print("All 15 tests passed.")
